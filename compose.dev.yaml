@@ -1,0 +1,109 @@
+services:
+  # Main AI Assistant Interface
+  chainlit:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: assistant-chainlit
+    restart: unless-stopped
+    ports:
+      - 8501:8501
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - VAULT_PATH=/vault
+      - LLM_MODEL=${LLM_MODEL:-google/gemini-3-flash-preview:online}
+      - EXTRACTION_MODEL=${EXTRACTION_MODEL:-google/gemini-3-flash-preview}
+      - ICAL_URL=${ICAL_URL:-}
+      - TZ=${TZ:-}
+      - OMP_NUM_THREADS=4
+      - ORT_DISABLE_CPU_AFFINITY=1
+      - TOKENIZERS_PARALLELISM=false
+    volumes:
+      - ./vault:/vault
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      chromadb:
+        condition: service_healthy
+    networks:
+      - assistant-net
+  # Vector Database for Semantic Search
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: assistant-chromadb
+    restart: unless-stopped
+    environment:
+      - CHROMA_SERVER_AUTHN_PROVIDER=
+      - ANONYMIZED_TELEMETRY=FALSE
+    volumes:
+      - ./chromadb_data:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    # ports:
+    #   - 8100:8000
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - bash -c 'echo > /dev/tcp/localhost/8000'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - assistant-net
+  # Nightly Scheduler for Automated Tasks
+  scheduler:
+    build:
+      context: ./scheduler
+      dockerfile: Dockerfile
+    container_name: assistant-scheduler
+    restart: unless-stopped
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - VAULT_PATH=/vault
+      - LLM_MODEL=${LLM_MODEL:-google/gemini-3-flash-preview:online}
+      - TZ=${TZ:-}
+      # Fix ONNX thread affinity errors in Docker
+      - OMP_NUM_THREADS=4
+      - ORT_DISABLE_CPU_AFFINITY=1
+      - TOKENIZERS_PARALLELISM=false
+    volumes:
+      - ./vault:/vault
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      chromadb:
+        condition: service_healthy
+    networks:
+      - assistant-net
+  # WebDAV Server for Obsidian Remote Save
+  webdav:
+    image: rclone/rclone:latest
+    container_name: assistant-webdav
+    restart: unless-stopped
+    command:
+      - serve
+      - webdav
+      - /vault
+      - --addr
+      - 0.0.0.0:8080
+      - --user
+      - ${WEBDAV_USER:-admin}
+      - --pass
+      - ${WEBDAV_PASS:-changeme}
+      - --dir-cache-time
+      - "0"
+    volumes:
+      - ./vault:/vault/Assistant
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      - 8080:8080
+    networks:
+      - assistant-net
+networks:
+  assistant-net:
+    driver: bridge

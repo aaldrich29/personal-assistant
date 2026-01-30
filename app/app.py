@@ -1,0 +1,1230 @@
+import os
+
+# Fix ONNX runtime thread affinity errors in Docker - must be set before importing onnxruntime
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["ORT_DISABLE_CPU_AFFINITY"] = "1"
+
+# Suppress ONNX runtime thread affinity errors (they're harmless but noisy in Docker)
+import onnxruntime as ort
+ort.set_default_logger_severity(4)  # 4 = fatal only, suppresses the pthread_setaffinity_np errors
+
+import json
+import asyncio
+import base64
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional, Dict, List, Union
+import urllib.request
+import ssl
+from zoneinfo import ZoneInfo
+
+import chainlit as cl
+from openai import AsyncOpenAI
+import chromadb
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+VAULT_PATH = Path(os.environ.get("VAULT_PATH", "/vault"))
+CHROMA_HOST = os.environ.get("CHROMA_HOST", "chromadb")
+CHROMA_PORT = int(os.environ.get("CHROMA_PORT", 8000))
+LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemini-2.0-flash-001")
+EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "google/gemini-2.0-flash-001")
+ICAL_URL = os.environ.get("ICAL_URL", "")
+
+
+def get_local_timezone() -> ZoneInfo:
+    """Get the configured timezone or fall back to system local. Uses TZ env var."""
+    tz = os.environ.get("TZ", "")
+    if tz:
+        try:
+            return ZoneInfo(tz)
+        except Exception as e:
+            print(f"Invalid TZ '{tz}': {e}, falling back to local")
+    # Fall back to system local timezone
+    try:
+        import time
+        local_tz_name = time.tzname[0]
+        # Try to get a proper ZoneInfo from localtime
+        return datetime.now().astimezone().tzinfo
+    except Exception:
+        return timezone.utc
+
+
+# Initialize OpenRouter client (OpenAI-compatible)
+client = AsyncOpenAI(
+    api_key=os.environ.get("OPENROUTER_API_KEY"),
+    base_url="https://openrouter.ai/api/v1"
+)
+
+# Initialize ChromaDB client
+chroma_client = None
+
+def get_chroma_client():
+    global chroma_client
+    if chroma_client is None:
+        chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+    return chroma_client
+
+# ============================================================================
+# Vault File Operations
+# ============================================================================
+
+TOPIC_REGISTRY_PATH = "meta/topic_registry.json"
+
+def read_vault_file(relative_path: str) -> str:
+    """Read a file from the vault, return empty string if not found."""
+    file_path = VAULT_PATH / relative_path
+    if file_path.exists():
+        return file_path.read_text()
+    return ""
+
+def write_vault_file(relative_path: str, content: str) -> None:
+    """Write content to a vault file, creating directories as needed."""
+    file_path = VAULT_PATH / relative_path
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content)
+
+def append_vault_file(relative_path: str, content: str) -> None:
+    """Append content to a vault file."""
+    file_path = VAULT_PATH / relative_path
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, "a") as f:
+        f.write(content)
+
+def get_existing_vault_files() -> List[str]:
+    """Get list of all markdown files in the vault (excluding system dirs)."""
+    exclude_dirs = {'conversations', 'daily', 'meta'}
+    files = []
+    for md_file in VAULT_PATH.rglob("*.md"):
+        rel_path = md_file.relative_to(VAULT_PATH)
+        # Skip excluded directories
+        if rel_path.parts[0] not in exclude_dirs:
+            files.append(str(rel_path))
+    return sorted(files)
+
+# ============================================================================
+# Topic Registry Operations
+# ============================================================================
+
+def read_topic_registry() -> Dict:
+    """Read the topic registry, return empty dict if not found."""
+    content = read_vault_file(TOPIC_REGISTRY_PATH)
+    if content:
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            print("[REGISTRY] Failed to parse topic registry, returning empty")
+            return {"topics": {}}
+    return {"topics": {}}
+
+def write_topic_registry(registry: Dict) -> None:
+    """Write the topic registry to the vault."""
+    write_vault_file(TOPIC_REGISTRY_PATH, json.dumps(registry, indent=2))
+
+def register_topic(topic_id: str, description: str, vault_path: str, keywords: List[str]) -> None:
+    """Register a new topic in the registry."""
+    registry = read_topic_registry()
+    registry["topics"][topic_id] = {
+        "description": description,
+        "vault_path": vault_path,
+        "keywords": keywords,
+        "created": datetime.now().isoformat()
+    }
+    write_topic_registry(registry)
+    print(f"[REGISTRY] Registered new topic: {topic_id} -> {vault_path}")
+
+def get_topic_summary() -> str:
+    """Get a summary of registered topics for the LLM."""
+    registry = read_topic_registry()
+    if not registry.get("topics"):
+        return "No topics registered yet."
+
+    lines = []
+    for topic_id, info in registry["topics"].items():
+        keywords = ", ".join(info.get("keywords", [])[:5])
+        lines.append(f"- {topic_id}: {info.get('description', 'No description')} (path: {info.get('vault_path')}, keywords: {keywords})")
+    return "\n".join(lines)
+
+# ============================================================================
+# iCal Calendar Integration (with caching)
+# ============================================================================
+
+# Calendar cache to avoid repeated fetches
+_calendar_cache = {
+    "events": [],
+    "last_fetch": None,
+    "calendar_text_7day": "",
+    "calendar_md_content": ""
+}
+CALENDAR_CACHE_MINUTES = 10  # Minimum time between iCal fetches
+
+
+def _calendar_needs_refresh() -> bool:
+    """Check if calendar cache is stale without fetching."""
+    if not ICAL_URL:
+        return False
+    if not _calendar_cache["last_fetch"]:
+        return True
+    age = datetime.now() - _calendar_cache["last_fetch"]
+    return age.total_seconds() >= CALENDAR_CACHE_MINUTES * 60
+
+
+def _parse_ical_data(ical_data: str) -> List[Dict]:
+    """Parse iCal data string and return list of events."""
+    events = []
+    current_event = {}
+    in_event = False
+
+    for line in ical_data.split('\n'):
+        line = line.strip()
+        if line == 'BEGIN:VEVENT':
+            in_event = True
+            current_event = {}
+        elif line == 'END:VEVENT':
+            in_event = False
+            if current_event.get('start'):
+                events.append(current_event)
+            current_event = {}
+        elif in_event:
+            if line.startswith('SUMMARY:'):
+                current_event['summary'] = line[8:]
+            elif line.startswith('DTSTART'):
+                # Handle various date/time formats with timezone support
+                try:
+                    target_tz = get_local_timezone()
+
+                    # Extract TZID if present
+                    event_tz = None
+                    if ';TZID=' in line:
+                        tzid_part = line.split(';TZID=')[1].split(':')[0]
+                        try:
+                            event_tz = ZoneInfo(tzid_part)
+                        except Exception:
+                            pass
+
+                    date_str = line.split(':')[-1]
+
+                    if 'T' in date_str:
+                        is_utc = date_str.endswith('Z')
+                        dt_str = date_str[:15]
+                        dt = datetime.strptime(dt_str, '%Y%m%dT%H%M%S')
+
+                        if is_utc:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                            dt = dt.astimezone(target_tz)
+                        elif event_tz:
+                            dt = dt.replace(tzinfo=event_tz)
+                            dt = dt.astimezone(target_tz)
+                        else:
+                            dt = dt.replace(tzinfo=target_tz)
+
+                        current_event['start'] = dt
+                    else:
+                        dt = datetime.strptime(date_str[:8], '%Y%m%d')
+                        dt = dt.replace(tzinfo=target_tz)
+                        current_event['start'] = dt
+                        current_event['all_day'] = True
+                except Exception as e:
+                    print(f"[CALENDAR] Failed to parse date: {line}, error: {e}")
+            elif line.startswith('LOCATION:'):
+                current_event['location'] = line[9:]
+
+    return events
+
+
+def _fetch_ical_if_needed(force: bool = False) -> bool:
+    """Fetch iCal data if cache is stale. Returns True if fetch occurred."""
+    global _calendar_cache
+
+    if not ICAL_URL:
+        return False
+
+    # Check if cache is still valid
+    if not force and _calendar_cache["last_fetch"]:
+        age = datetime.now() - _calendar_cache["last_fetch"]
+        if age.total_seconds() < CALENDAR_CACHE_MINUTES * 60:
+            return False  # Cache still valid
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        with urllib.request.urlopen(ICAL_URL, timeout=10, context=ctx) as response:
+            ical_data = response.read().decode('utf-8')
+
+        events = _parse_ical_data(ical_data)
+        today = datetime.now().date()
+
+        # Filter to future events
+        future_events = [
+            e for e in events
+            if e.get('start') and e['start'].date() >= today
+        ]
+        future_events.sort(key=lambda x: x['start'])
+
+        # Build 7-day summary text
+        week_ahead = today + timedelta(days=7)
+        upcoming = [e for e in future_events if e['start'].date() <= week_ahead]
+
+        calendar_text = ""
+        if upcoming:
+            calendar_text = "## Calendar (Next 7 Days)\n"
+            current_date = None
+            for event in upcoming:
+                event_date = event['start'].date()
+                if event_date != current_date:
+                    current_date = event_date
+                    day_name = event['start'].strftime('%A, %B %d')
+                    calendar_text += f"\n**{day_name}**\n"
+                time_str = "All day" if event.get('all_day') else event['start'].strftime('%I:%M %p')
+                summary = event.get('summary', 'Untitled')
+                location = f" @ {event.get('location')}" if event.get('location') else ""
+                calendar_text += f"- {time_str}: {summary}{location}\n"
+
+        # Build full calendar.md content
+        md_content = ""
+        if future_events:
+            md_content = f"# Calendar Events\n\nLast updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            current_month = None
+            current_date = None
+            for event in future_events:
+                event_date = event['start'].date()
+                month_key = event['start'].strftime('%B %Y')
+                if month_key != current_month:
+                    current_month = month_key
+                    md_content += f"\n## {month_key}\n"
+                    current_date = None
+                if event_date != current_date:
+                    current_date = event_date
+                    day_name = event['start'].strftime('%A, %B %d')
+                    md_content += f"\n### {day_name}\n"
+                time_str = "All day" if event.get('all_day') else event['start'].strftime('%I:%M %p')
+                summary = event.get('summary', 'Untitled')
+                location = f" @ {event.get('location')}" if event.get('location') else ""
+                md_content += f"- {time_str}: {summary}{location}\n"
+
+        # Update cache
+        _calendar_cache = {
+            "events": future_events,
+            "last_fetch": datetime.now(),
+            "calendar_text_7day": calendar_text,
+            "calendar_md_content": md_content
+        }
+
+        print(f"[CALENDAR] Fetched and cached {len(future_events)} events")
+        return True
+
+    except Exception as e:
+        print(f"[CALENDAR] Fetch error: {e}")
+        return False
+
+
+def fetch_calendar_events() -> str:
+    """Get 7-day calendar summary from cache (fetches if needed)."""
+    _fetch_ical_if_needed()
+    return _calendar_cache["calendar_text_7day"]
+
+
+def save_calendar_to_vault():
+    """Save calendar.md to vault from cache (does not trigger fetch)."""
+    if _calendar_cache["calendar_md_content"]:
+        write_vault_file("schedules/calendar.md", _calendar_cache["calendar_md_content"])
+        print(f"[CALENDAR] Saved {len(_calendar_cache['events'])} events to schedules/calendar.md")
+
+
+async def index_calendar_async():
+    """Index calendar to ChromaDB asynchronously (non-blocking)."""
+    try:
+        # Delete old calendar entries first
+        collection = get_or_create_collection()
+        try:
+            # Get all calendar event IDs and delete them
+            results = collection.get(where={"category": "calendar"})
+            if results and results.get("ids"):
+                collection.delete(ids=results["ids"])
+                print(f"[CALENDAR] Removed {len(results['ids'])} old calendar entries from ChromaDB")
+        except Exception as e:
+            print(f"[CALENDAR] Error cleaning old entries: {e}")
+
+        # Index calendar.md as chunks (not individual events)
+        content = _calendar_cache["calendar_md_content"]
+        if not content:
+            return
+
+        # Chunk the calendar content (1000 chars, 200 overlap)
+        chunk_size = 1000
+        overlap = 200
+        chunks = []
+        for i in range(0, len(content), chunk_size - overlap):
+            chunk = content[i:i + chunk_size]
+            if chunk.strip():
+                chunks.append(chunk)
+
+        # Index each chunk
+        for i, chunk in enumerate(chunks):
+            doc_id = f"schedules/calendar.md_chunk_{i}"
+            index_to_chroma(
+                doc_id=doc_id,
+                content=chunk,
+                metadata={
+                    "source": "schedules/calendar.md",
+                    "category": "calendar",
+                    "chunk_index": i,
+                    "total_chunks": len(chunks)
+                }
+            )
+
+        print(f"[CALENDAR] Indexed calendar.md as {len(chunks)} chunks to ChromaDB")
+
+    except Exception as e:
+        print(f"[CALENDAR] Async indexing error: {e}")
+
+
+def refresh_calendar_if_needed():
+    """Check if calendar needs refresh and trigger async indexing if so."""
+    fetched = _fetch_ical_if_needed()
+    if fetched:
+        # Save file synchronously (fast), index async (slow)
+        save_calendar_to_vault()
+        # Return the coroutine for async execution
+        return index_calendar_async()
+    return None
+
+# ============================================================================
+# ChromaDB Operations
+# ============================================================================
+
+def get_or_create_collection(name: str = "vault_documents"):
+    """Get or create a ChromaDB collection."""
+    return get_chroma_client().get_or_create_collection(
+        name=name,
+        metadata={"hnsw:space": "cosine"}
+    )
+
+def search_chroma(query: str, n_results: int = 5) -> List[Dict]:
+    """Search ChromaDB for relevant documents."""
+    try:
+        collection = get_or_create_collection()
+        results = collection.query(
+            query_texts=[query],
+            n_results=n_results,
+            include=["documents", "metadatas", "distances"]
+        )
+
+        retrieved = []
+        if results and results["documents"] and results["documents"][0]:
+            for i, doc in enumerate(results["documents"][0]):
+                retrieved.append({
+                    "content": doc,
+                    "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
+                    "distance": results["distances"][0][i] if results["distances"] else None
+                })
+        return retrieved
+    except Exception as e:
+        print(f"ChromaDB search error: {e}")
+        return []
+
+def index_to_chroma(doc_id: str, content: str, metadata: Dict = None):
+    """Index a document to ChromaDB."""
+    try:
+        collection = get_or_create_collection()
+        collection.upsert(
+            ids=[doc_id],
+            documents=[content],
+            metadatas=[metadata or {}]
+        )
+    except Exception as e:
+        print(f"ChromaDB indexing error: {e}")
+
+# ============================================================================
+# File Upload Processing
+# ============================================================================
+
+SUPPORTED_IMAGE_TYPES = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+SUPPORTED_DOC_TYPES = {'.pdf'}
+
+def get_mime_type(file_path: str) -> str:
+    """Get MIME type based on file extension."""
+    ext = Path(file_path).suffix.lower()
+    mime_map = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.pdf': 'application/pdf',
+    }
+    return mime_map.get(ext, 'application/octet-stream')
+
+async def process_uploaded_files(elements: List) -> tuple[List[Dict], List[str]]:
+    """
+    Process uploaded file elements and convert to base64 for the API.
+    Returns a tuple of (content_parts for API, file_descriptions for history).
+    """
+    content_parts = []
+    file_descriptions = []
+
+    if not elements:
+        return content_parts, file_descriptions
+
+    for element in elements:
+        try:
+            file_path = element.path if hasattr(element, 'path') else None
+            file_name = element.name if hasattr(element, 'name') else 'unknown'
+
+            if not file_path:
+                continue
+
+            ext = Path(file_name).suffix.lower()
+
+            # Check if it's a supported file type
+            if ext in SUPPORTED_IMAGE_TYPES:
+                # Read and encode image
+                with open(file_path, 'rb') as f:
+                    file_data = base64.b64encode(f.read()).decode('utf-8')
+
+                mime_type = get_mime_type(file_name)
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{file_data}"
+                    }
+                })
+                file_descriptions.append(f"[Uploaded image: {file_name}]")
+                print(f"[FILE] Processed image: {file_name}")
+
+            elif ext in SUPPORTED_DOC_TYPES:
+                # Read and encode PDF
+                with open(file_path, 'rb') as f:
+                    file_data = base64.b64encode(f.read()).decode('utf-8')
+
+                mime_type = get_mime_type(file_name)
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{file_data}"
+                    }
+                })
+                file_descriptions.append(f"[Uploaded PDF: {file_name}]")
+                print(f"[FILE] Processed PDF: {file_name}")
+            else:
+                print(f"[FILE] Skipping unsupported file type: {file_name}")
+                file_descriptions.append(f"[Skipped unsupported file: {file_name}]")
+
+        except Exception as e:
+            print(f"[FILE] Error processing {element}: {e}")
+
+    return content_parts, file_descriptions
+
+def build_multimodal_content(text: str, file_parts: List[Dict]) -> Union[str, List[Dict]]:
+    """
+    Build content for API message, either as plain text or multimodal array.
+    """
+    if not file_parts:
+        return text
+
+    # Build multimodal content array
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    content.extend(file_parts)
+    return content
+
+# ============================================================================
+# Context Building
+# ============================================================================
+
+def build_system_context(learned_behaviors: str = None, daily_prep: str = None) -> str:
+    """Build the system prompt from vault files.
+
+    Args:
+        learned_behaviors: Pre-loaded learned behaviors content (avoids duplicate read)
+        daily_prep: Pre-loaded daily prep content (avoids duplicate read)
+    """
+
+    # Load core instructions
+    instructions = read_vault_file("meta/instructions.md")
+    if not instructions:
+        instructions = """You are a helpful personal AI assistant.
+You help manage family information, schedules, notes, and daily tasks.
+Be warm, helpful, and remember important details about the family."""
+
+    # Load learned behaviors (use passed value or read from file)
+    if learned_behaviors is None:
+        learned_behaviors = read_vault_file("meta/learned_behaviors.md")
+
+    # Load recent context
+    recent_context = read_vault_file("meta/recent_context.md")
+
+    # Load daily prep (use passed value or read from file)
+    if daily_prep is None:
+        daily_prep = read_vault_file("meta/daily_prep.md")
+
+    # Load preferences
+    preferences = read_vault_file("meta/preferences.md")
+
+    # Get calendar events from cache (already fetched if needed during on_chat_start)
+    calendar_events = _calendar_cache["calendar_text_7day"]
+
+    # Build full system prompt
+    system_prompt = f"""# Your Core Instructions
+{instructions}
+
+# Your Learned Behaviors (You can update this!)
+{learned_behaviors if learned_behaviors else "No learned behaviors yet."}
+
+# Recent Context
+{recent_context if recent_context else "No recent context available."}
+
+# Today's Preparation
+{daily_prep if daily_prep else "No specific preparation for today."}
+
+# User Preferences
+{preferences if preferences else "No specific preferences recorded yet."}
+
+{calendar_events}
+
+# Current Date/Time
+{datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")}
+
+# Your Capabilities
+You can:
+- Search your knowledge vault for relevant information
+- Save important information to appropriate vault files
+- Remember family members, schedules, preferences
+- Track health, school, and general notes
+- Help with meal planning, workouts, and daily tasks
+- View the family calendar
+- **Update your own learned behaviors** when you discover patterns or preferences
+
+# Proactive Behavior
+Be proactively helpful:
+- If you notice something relevant from your context, bring it up naturally
+- If you have follow-up items or questions from previous conversations, ask about them
+- If today's calendar shows relevant events, mention them when appropriate
+- If you learn a new preference or pattern, mention that you'll remember it
+
+# Self-Improvement
+When you notice patterns in how the user likes things done, or learn new rules to follow:
+- You can update your "learned_behaviors" to remember these patterns
+- Include follow-up items you want to ask about later
+- Track communication preferences
+- Note routine patterns you observe
+
+When you learn something important, naturally acknowledge it. Be warm and conversational.
+"""
+    return system_prompt
+
+async def get_semantic_context(user_message: str) -> str:
+    """Retrieve semantically relevant context from ChromaDB."""
+    results = search_chroma(user_message, n_results=5)
+
+    if not results:
+        return ""
+
+    context_parts = ["# Relevant Information from Your Knowledge Vault:"]
+    for result in results:
+        # Only include if reasonably relevant (distance < 1.0 for cosine)
+        if result["distance"] is not None and result["distance"] < 1.0:
+            source = result["metadata"].get("source", "notes")
+            context_parts.append(f"\n## From {source}:\n{result['content']}")
+
+    return "\n".join(context_parts) if len(context_parts) > 1 else ""
+
+# ============================================================================
+# Topic Resolution
+# ============================================================================
+
+TOPIC_RESOLUTION_PROMPT = """Analyze this conversation and determine where information should be stored.
+
+## Registered Topics (use these paths if the conversation matches):
+{topic_summary}
+
+## Existing Vault Files (for reference):
+{existing_files}
+
+## Conversation:
+User: {user_message}
+Assistant: {assistant_response}
+
+## Your Task:
+1. Does this conversation contain information worth saving? If it's just chitchat or simple Q&A with no new facts, respond with {{"should_save": false}}
+
+2. If worth saving, does it relate to an EXISTING registered topic above?
+   - If yes: use that topic's vault_path
+   - If no: create a NEW topic with a sensible path
+
+3. For NEW topics, follow these conventions:
+   - Family member info → family/members/[name].md
+   - Family events/trips → family/events/[event_name].md
+   - Health/medical → notes/health/[topic].md
+   - School info → notes/school/[child_name].md
+   - Travel/vacations → notes/travel/[destination_year].md
+   - Food/dining preferences → notes/food/[topic].md
+   - Recipes → recipes/[recipe_name].md
+   - Workouts → workouts/[name].md
+   - General topics → notes/[category]/[topic].md
+
+Respond with JSON only:
+{{
+    "should_save": true/false,
+    "is_new_topic": true/false,
+    "topic_id": "snake_case_identifier",
+    "topic_description": "Brief description of what this topic covers",
+    "vault_path": "path/to/file.md",
+    "keywords": ["keyword1", "keyword2", "keyword3"],
+    "reason": "Brief explanation of your decision"
+}}
+
+If should_save is false, only include: {{"should_save": false, "reason": "why not saving"}}
+"""
+
+async def resolve_topic(user_message: str, assistant_response: str) -> Optional[Dict]:
+    """Resolve which topic/path this conversation belongs to."""
+    try:
+        # Get context for the resolution
+        topic_summary = get_topic_summary()
+        existing_files = get_existing_vault_files()
+        existing_files_str = "\n".join(f"- {f}" for f in existing_files[:50])  # Limit to 50 files
+
+        if not existing_files_str:
+            existing_files_str = "No existing files yet."
+
+        print(f"[TOPIC] Resolving topic for: {user_message[:50]}...")
+
+        response = await client.chat.completions.create(
+            model=EXTRACTION_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a knowledge organization assistant. Respond with valid JSON only. No markdown, no code blocks, just raw JSON."},
+                {"role": "user", "content": TOPIC_RESOLUTION_PROMPT.format(
+                    topic_summary=topic_summary,
+                    existing_files=existing_files_str,
+                    user_message=user_message,
+                    assistant_response=assistant_response
+                )}
+            ],
+            temperature=0.1,
+            max_tokens=500
+        )
+
+        result_text = response.choices[0].message.content
+        print(f"[TOPIC] Raw response: {result_text[:200]}")
+
+        # Clean up potential markdown formatting
+        if "```json" in result_text:
+            result_text = result_text.split("```json")[1].split("```")[0]
+        elif "```" in result_text:
+            result_text = result_text.split("```")[1].split("```")[0]
+
+        result_text = result_text.strip()
+
+        # Find JSON object if not at start
+        if not result_text.startswith("{"):
+            start_idx = result_text.find("{")
+            if start_idx != -1:
+                brace_count = 0
+                end_idx = start_idx
+                for i, char in enumerate(result_text[start_idx:], start_idx):
+                    if char == "{":
+                        brace_count += 1
+                    elif char == "}":
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_idx = i + 1
+                            break
+                result_text = result_text[start_idx:end_idx]
+
+        parsed = json.loads(result_text)
+        print(f"[TOPIC] Resolved: should_save={parsed.get('should_save')}, topic={parsed.get('topic_id')}, path={parsed.get('vault_path')}")
+
+        # Register new topic if needed
+        if parsed.get("should_save") and parsed.get("is_new_topic"):
+            register_topic(
+                topic_id=parsed.get("topic_id", "unknown"),
+                description=parsed.get("topic_description", ""),
+                vault_path=parsed.get("vault_path", "notes/general/misc.md"),
+                keywords=parsed.get("keywords", [])
+            )
+
+        return parsed
+
+    except Exception as e:
+        print(f"[TOPIC] Error resolving topic: {e}")
+        import traceback
+        print(f"[TOPIC] Traceback: {traceback.format_exc()}")
+        return None
+
+# ============================================================================
+# Learning and Information Extraction
+# ============================================================================
+
+EXTRACTION_PROMPT = """Extract the key information from this conversation to save to the vault.
+
+## Target File: {vault_path}
+## Topic: {topic_description}
+
+## What to Extract:
+- Key facts, dates, details, preferences mentioned
+- Names, places, times, costs if relevant
+- Decisions made or plans confirmed
+- Any actionable items or things to remember
+
+## Self-Improvement (optional):
+If you notice patterns in how the user communicates or preferences for how things should be done, note them.
+
+Respond with JSON:
+{{
+    "information": "The key information to save (formatted as markdown, can be multiple paragraphs)",
+    "subject": "Brief subject line for this entry",
+    "behavior_updates": {{
+        "should_update": true/false,
+        "section": "communication_preferences|routine_patterns|follow_up_items|custom_rules",
+        "content": "what to add to learned behaviors (only if there's a new pattern/preference)"
+    }}
+}}
+
+Conversation:
+User: {user_message}
+Assistant: {assistant_response}
+"""
+
+async def extract_learnings(user_message: str, assistant_response: str, topic_info: Dict) -> Optional[Dict]:
+    """Extract important information from a conversation exchange using resolved topic."""
+    result_text = None
+    try:
+        vault_path = topic_info.get("vault_path", "notes/general/misc.md")
+        topic_description = topic_info.get("topic_description", "General notes")
+
+        print(f"[EXTRACT] Extracting for topic: {topic_info.get('topic_id')} -> {vault_path}")
+
+        response = await client.chat.completions.create(
+            model=EXTRACTION_MODEL,
+            messages=[
+                {"role": "system", "content": "You are an information extraction assistant. Respond with valid JSON only. No markdown, no code blocks, just raw JSON."},
+                {"role": "user", "content": EXTRACTION_PROMPT.format(
+                    vault_path=vault_path,
+                    topic_description=topic_description,
+                    user_message=user_message,
+                    assistant_response=assistant_response
+                )}
+            ],
+            temperature=0.1,
+            max_tokens=1500
+        )
+
+        result_text = response.choices[0].message.content
+        print(f"[EXTRACT] Raw response: {repr(result_text[:200])}")
+
+        # Clean up potential markdown formatting
+        if "```json" in result_text:
+            result_text = result_text.split("```json")[1].split("```")[0]
+        elif "```" in result_text:
+            result_text = result_text.split("```")[1].split("```")[0]
+
+        result_text = result_text.strip()
+
+        # Find JSON object if not at start
+        if not result_text.startswith("{"):
+            start_idx = result_text.find("{")
+            if start_idx != -1:
+                brace_count = 0
+                end_idx = start_idx
+                for i, char in enumerate(result_text[start_idx:], start_idx):
+                    if char == "{":
+                        brace_count += 1
+                    elif char == "}":
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_idx = i + 1
+                            break
+                result_text = result_text[start_idx:end_idx]
+            else:
+                print("[EXTRACT] No JSON object found in response!")
+                return None
+
+        parsed = json.loads(result_text)
+
+        # Add the vault_path from topic resolution
+        parsed["vault_path"] = vault_path
+        parsed["topic_id"] = topic_info.get("topic_id")
+
+        print(f"[EXTRACT] Extracted info for {vault_path}: {parsed.get('subject', 'no subject')}")
+        return parsed
+
+    except json.JSONDecodeError as e:
+        print(f"[EXTRACT] JSON decode error: {e}")
+        if result_text:
+            print(f"[EXTRACT] Failed text: {repr(result_text[:500])}")
+        return None
+    except Exception as e:
+        print(f"[EXTRACT] Exception: {type(e).__name__}: {e}")
+        import traceback
+        print(f"[EXTRACT] Traceback: {traceback.format_exc()}")
+        return None
+
+async def save_learnings(extraction: Dict):
+    """Save extracted learnings to the vault and index to ChromaDB."""
+    if not extraction:
+        return
+
+    vault_path = extraction.get("vault_path")
+    subject = extraction.get("subject", "Note")
+    info = extraction.get("information", "")
+    topic_id = extraction.get("topic_id", "unknown")
+
+    if not info or not vault_path:
+        print("[SAVE] No information or vault_path to save")
+        return
+
+    # Check if file exists to determine formatting
+    existing = read_vault_file(vault_path)
+
+    if not existing:
+        new_content = f"# {subject}\n\n"
+        new_content += f"## {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        new_content += f"{info}\n"
+    else:
+        new_content = f"\n\n## {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        new_content += f"{info}\n"
+
+    if existing:
+        append_vault_file(vault_path, new_content)
+    else:
+        write_vault_file(vault_path, new_content)
+
+    # Index to ChromaDB
+    doc_id = f"{vault_path}_{datetime.now().timestamp()}"
+    index_to_chroma(
+        doc_id=doc_id,
+        content=info,
+        metadata={
+            "source": vault_path,
+            "topic_id": topic_id,
+            "subject": subject,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+    print(f"[SAVE] Saved to {vault_path}: {info[:50]}...")
+
+    # Update learned behaviors if needed
+    behavior_updates = extraction.get("behavior_updates", {})
+    if behavior_updates.get("should_update"):
+        await update_learned_behaviors(
+            behavior_updates.get("section", "custom_rules"),
+            behavior_updates.get("content", "")
+        )
+
+async def update_learned_behaviors(section: str, content: str):
+    """Update the learned behaviors file."""
+    if not content:
+        return
+
+    behaviors_path = "meta/learned_behaviors.md"
+    current = read_vault_file(behaviors_path)
+
+    section_map = {
+        "communication_preferences": "## Communication Preferences",
+        "routine_patterns": "## Routine Patterns",
+        "follow_up_items": "## Follow-up Items",
+        "custom_rules": "## Custom Rules"
+    }
+
+    section_header = section_map.get(section, "## Custom Rules")
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+    new_entry = f"\n- [{timestamp}] {content}"
+
+    if section_header in current:
+        # Find the section and append to it
+        parts = current.split(section_header)
+        if len(parts) >= 2:
+            # Find the next section or end
+            rest = parts[1]
+            next_section = rest.find("\n## ")
+            if next_section != -1:
+                section_content = rest[:next_section]
+                after_section = rest[next_section:]
+                updated = parts[0] + section_header + section_content + new_entry + after_section
+            else:
+                updated = parts[0] + section_header + rest + new_entry
+            write_vault_file(behaviors_path, updated)
+            print(f"Updated learned behaviors ({section}): {content[:50]}...")
+    else:
+        # Section doesn't exist, append it
+        append_vault_file(behaviors_path, f"\n\n{section_header}{new_entry}")
+        print(f"Added new behavior section ({section}): {content[:50]}...")
+
+# ============================================================================
+# Conversation Saving
+# ============================================================================
+
+async def save_conversation(messages: List[Dict], session_id: str):
+    """Save the conversation to the vault."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    conv_path = f"conversations/{today}/{session_id}.md"
+
+    content = f"# Conversation - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+    for msg in messages:
+        role = msg.get("role", "unknown").title()
+        msg_content = msg.get("content", "")
+        content += f"**{role}:** {msg_content}\n\n"
+
+    write_vault_file(conv_path, content)
+
+# ============================================================================
+# Chainlit Event Handlers
+# ============================================================================
+
+def ensure_vault_setup():
+    """Ensure essential vault files exist with default content."""
+    defaults = {
+        "meta/instructions.md": """# Personal Assistant Instructions
+
+You are a personal AI assistant for a busy family. Your role is to be genuinely helpful, remember important details, and make daily life easier.
+
+## Your Personality
+- Warm and friendly, like a trusted friend
+- Concise but thorough - respect their time
+- Proactive when helpful, but not pushy
+- Remember you're talking to a real person managing a busy life
+
+## What You Help With
+
+### Family Management
+- Remember each family member's name, age, activities, and preferences
+- Track kids' school activities, homework, accomplishments
+- Note important milestones and events
+
+### Health & Wellness
+- Track health information, allergies, medications
+- Remember doctor appointments and notes
+- Monitor sleep patterns, symptoms, or concerns mentioned
+- Support workout routines and fitness goals
+
+### Daily Life
+- Help with meal planning based on preferences and dietary needs
+- Remember favorite recipes and food preferences
+- Track schedules and routines
+- Generate to-do lists based on what you know
+
+### Learning & Adapting
+- Notice patterns in how the family operates
+- Learn preferences without being told explicitly
+- Adapt your suggestions based on past conversations
+- Remember how they like things done
+
+## How to Learn
+
+When you hear important information:
+1. Naturally acknowledge it in conversation
+2. It will be automatically saved to your knowledge vault
+3. Use it in future conversations when relevant
+
+## Important Guidelines
+- Never share family information externally
+- Treat health information with extra care
+- When unsure, ask clarifying questions
+- If something seems urgent or concerning, acknowledge it appropriately
+- Be helpful with curriculum-based questions using stored school information
+
+## Daily Rhythm
+- In the morning, be ready with relevant reminders
+- During the day, help with whatever comes up
+- Remember that context from earlier conversations carries forward
+""",
+        "meta/learned_behaviors.md": """# Learned Behaviors
+
+This file is automatically updated by the assistant as it learns patterns and preferences.
+
+## Communication Preferences
+*How the family prefers to receive information*
+
+## Routine Patterns
+*Regular schedules and habits the assistant has noticed*
+
+## Follow-up Items
+*Things to check back on or ask about*
+
+## Custom Rules
+*Specific rules the assistant has learned to follow*
+""",
+        "meta/recent_context.md": "# Recent Context\n\n*Summary of recent conversations and events*\n",
+        "meta/daily_prep.md": "# Daily Prep\n\n*Reminders and context for the upcoming day*\n",
+        "meta/preferences.md": "# User Preferences\n\n*Preferences will be learned automatically from conversations.*\n",
+    }
+    for path, content in defaults.items():
+        file_path = VAULT_PATH / path
+        if not file_path.exists():
+            print(f"[INIT] Creating default vault file: {path}")
+            write_vault_file(path, content)
+
+@cl.on_chat_start
+async def on_chat_start():
+    """Initialize chat session with context from vault."""
+
+    # Ensure vault is ready
+    ensure_vault_setup()
+
+    # Generate session ID
+    session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    cl.user_session.set("session_id", session_id)
+    cl.user_session.set("messages", [])
+
+    # Refresh calendar if cache is stale - show loading indicator during fetch
+    index_task = None
+    if _calendar_needs_refresh():
+        async with cl.Step(name="Fetching calendar...") as step:
+            # Run blocking fetch in thread so UI can show loading state
+            index_task = await asyncio.to_thread(refresh_calendar_if_needed)
+            step.output = f"Loaded {len(_calendar_cache['events'])} events"
+    else:
+        index_task = refresh_calendar_if_needed()
+
+    if index_task:
+        # Fire off ChromaDB indexing in background, don't wait for it
+        asyncio.create_task(index_task)
+
+    # Read files once for both system context and welcome message
+    learned = read_vault_file("meta/learned_behaviors.md")
+    daily_prep = read_vault_file("meta/daily_prep.md")
+
+    # Build and store system context (pass pre-loaded files to avoid duplicate reads)
+    system_context = build_system_context(learned_behaviors=learned, daily_prep=daily_prep)
+    cl.user_session.set("system_context", system_context)
+
+    # Use cached calendar for welcome message
+    calendar = _calendar_cache["calendar_text_7day"]
+
+    # Build a proactive welcome message
+    welcome_parts = []
+
+    # Time-based greeting
+    hour = datetime.now().hour
+    if hour < 12:
+        greeting = "Good morning"
+    elif hour < 17:
+        greeting = "Good afternoon"
+    else:
+        greeting = "Good evening"
+
+    welcome_parts.append(f"{greeting}! I'm ready to help.")
+
+    # Check for follow-up items
+    if learned and "## Follow-up Items" in learned:
+        follow_section = learned.split("## Follow-up Items")[1]
+        next_section = follow_section.find("\n## ")
+        if next_section != -1:
+            follow_section = follow_section[:next_section]
+        if follow_section.strip() and "-" in follow_section:
+            welcome_parts.append("\n\nI have some follow-up items from before - feel free to ask me about them!")
+
+    # Mention calendar if there are events today
+    if calendar and datetime.now().strftime('%A, %B %d') in calendar:
+        welcome_parts.append("\n\nI can see you have events on the calendar today if you'd like to review them.")
+
+    welcome = " ".join(welcome_parts)
+    await cl.Message(content=welcome).send()
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    """Process incoming messages."""
+
+    # Get session data
+    messages = cl.user_session.get("messages", [])
+    system_context = cl.user_session.get("system_context", "")
+    session_id = cl.user_session.get("session_id", "unknown")
+
+    # Process any uploaded files
+    file_parts, file_descriptions = await process_uploaded_files(message.elements)
+
+    # Get semantic context from ChromaDB
+    semantic_context = await get_semantic_context(message.content)
+
+    # Build full system prompt with semantic context
+    full_system_prompt = system_context
+    if semantic_context:
+        full_system_prompt += f"\n\n{semantic_context}"
+
+    # Build the user message content (multimodal if files attached)
+    user_content = build_multimodal_content(message.content, file_parts)
+
+    # For conversation history, store text version with file descriptions
+    history_content = message.content
+    if file_descriptions:
+        history_content = f"{message.content}\n{' '.join(file_descriptions)}"
+
+    # Add user message to history (text version for saving)
+    messages.append({"role": "user", "content": history_content})
+
+    # Build messages for API call (keep last 100 messages for context)
+    # Use multimodal content for current message, text for history
+    api_messages = [
+        {"role": "system", "content": full_system_prompt}
+    ] + messages[-100:-1] + [{"role": "user", "content": user_content}]
+
+    # Create streaming response
+    response_message = cl.Message(content="")
+    await response_message.send()
+
+    # Stream the response
+    full_response = ""
+    try:
+        stream = await client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=api_messages,
+            stream=True,
+            temperature=0.7,
+            max_tokens=2000,
+            extra_body={
+                "reasoning": {
+                    "effort": "medium"
+                }
+            }
+        )
+
+        async for chunk in stream:
+            if chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                full_response += content
+                await response_message.stream_token(content)
+
+        await response_message.update()
+
+    except Exception as e:
+        full_response = f"I encountered an error: {str(e)}"
+        await response_message.update(content=full_response)
+
+    # Add assistant response to history
+    messages.append({"role": "assistant", "content": full_response})
+    cl.user_session.set("messages", messages)
+
+    # Background tasks: extract learnings and save conversation
+    asyncio.create_task(extract_and_save(history_content, full_response))
+    asyncio.create_task(save_conversation(messages, session_id))
+
+async def extract_and_save(user_message: str, assistant_response: str):
+    """Background task to resolve topic, extract, and save learnings."""
+    # Phase 1: Resolve which topic this belongs to
+    topic_info = await resolve_topic(user_message, assistant_response)
+
+    if not topic_info or not topic_info.get("should_save"):
+        print(f"[EXTRACT] Nothing to save: {topic_info.get('reason', 'no reason given') if topic_info else 'topic resolution failed'}")
+        return
+
+    # Phase 2: Extract the actual information using the resolved topic
+    extraction = await extract_learnings(user_message, assistant_response, topic_info)
+
+    if extraction:
+        await save_learnings(extraction)
+
+@cl.on_chat_end
+async def on_chat_end():
+    """Handle chat session end."""
+    messages = cl.user_session.get("messages", [])
+    session_id = cl.user_session.get("session_id", "unknown")
+
+    # Final save of conversation
+    if messages:
+        await save_conversation(messages, session_id)

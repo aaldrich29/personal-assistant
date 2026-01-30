@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+.env
+.DS_Store
+chromadb_data/*
+!chromadb_data/.gitkeep
+
+# Vault data exclusions
+vault/conversations/*
+!vault/conversations/.gitkeep
+vault/daily/*
+!vault/daily/.gitkeep
+vault/family/members/*
+!vault/family/members/.gitkeep
+!vault/family/members/template.md
+vault/family/events/*
+!vault/family/events/.gitkeep
+vault/family/pets/*
+!vault/family/pets/.gitkeep
+vault/notes/health/*
+!vault/notes/health/.gitkeep
+vault/notes/school/*
+!vault/notes/school/.gitkeep
+vault/notes/travel/*
+!vault/notes/travel/.gitkeep
+vault/schedules/*
+!vault/schedules/.gitkeep
+vault/recipes/*
+!vault/recipes/.gitkeep
+vault/workouts/*
+!vault/workouts/.gitkeep
+
+# Environments
+.venv
+venv/
+
+# Docker
+.docker_data/
