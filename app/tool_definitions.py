@@ -91,5 +91,30 @@ tools_schema = [
                 "required": ["query"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather and forecast for a location. Use this when the user asks about weather conditions, temperature, or forecasts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City name (e.g., 'New York', 'London', 'Tokyo'), coordinates as 'lat,lon' (e.g., '40.71,-74.01'), or Zip Code (e.g., '32801'). Zip Codes are the most reliable."
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Number of forecast days (1-7). Defaults to 3."
+                    },
+                    "hourly": {
+                        "type": "boolean",
+                        "description": "If true, returns hourly temperature and precipitation probability. Defaults to false."
+                    }
+                },
+                "required": ["location"]
+            }
+        }
     }
 ]

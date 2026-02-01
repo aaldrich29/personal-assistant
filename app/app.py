@@ -325,6 +325,186 @@ async def web_search_tool(query: str) -> str:
     except Exception as e:
         return f"Web search failed: {str(e)}"
 
+async def get_weather_tool(location: str, days: int = 3, hourly: bool = False) -> str:
+    """Get weather from Open-Meteo API (free, no API key required)."""
+    import urllib.parse
+
+    days = max(1, min(7, days))  # Clamp to 1-7
+
+    def fetch_weather():
+        # Check if location is coordinates (lat,lon format)
+        if ',' in location and all(part.replace('.', '').replace('-', '').isdigit()
+                                    for part in location.split(',')):
+            parts = location.split(',')
+            lat, lon = float(parts[0].strip()), float(parts[1].strip())
+            name = f"{lat}, {lon}"
+        else:
+            # Geocode the city name using Open-Meteo geocoding API
+            ctx = ssl.create_default_context()
+            
+            # First attempt: search for the exact string
+            encoded_location = urllib.parse.quote(location)
+            geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={encoded_location}&count=10"
+            
+            with urllib.request.urlopen(geo_url, timeout=10, context=ctx) as resp:
+                geo_data = json.loads(resp.read().decode())
+
+            results = geo_data.get("results", [])
+
+            # Second attempt: If no results and comma exists, split and search for city, then filter
+            if not results and "," in location:
+                parts = [p.strip() for p in location.split(",")]
+                city_name = parts[0]
+                context_parts = parts[1:]
+                
+                encoded_city = urllib.parse.quote(city_name)
+                geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={encoded_city}&count=10"
+                with urllib.request.urlopen(geo_url, timeout=10, context=ctx) as resp:
+                    geo_data = json.loads(resp.read().decode())
+                
+                candidates = geo_data.get("results", [])
+                
+                # Filter candidates based on context (state/country)
+                for candidate in candidates:
+                    candidate_values = [
+                        candidate.get("admin1", "").lower(),
+                        candidate.get("country", "").lower(),
+                        candidate.get("admin2", "").lower()
+                    ]
+                    # Check if any context part matches any candidate value
+                    for ctx_part in context_parts:
+                        if any(ctx_part.lower() in val for val in candidate_values if val):
+                            results = [candidate]
+                            break
+                    if results:
+                        break
+                
+                # If still no results after filtering, but we found candidates for the city, use the first one
+                if not results and candidates:
+                    results = [candidates[0]]
+
+            if not results:
+                return f"Location not found: {location}"
+
+            result = results[0]
+            lat = result["latitude"]
+            lon = result["longitude"]
+            name = result.get("name", location)
+            country = result.get("country", "")
+            state = result.get("admin1", "")
+            
+            display_parts = [name]
+            if state: display_parts.append(state)
+            if country: display_parts.append(country)
+            name = ", ".join(display_parts)
+
+        # Fetch weather data
+        weather_url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}"
+            f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
+            f"precipitation,weather_code,wind_speed_10m,wind_direction_10m"
+            f"&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+            f"precipitation_probability_max,precipitation_sum"
+            f"&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch"
+            f"&timezone=auto&forecast_days={days}"
+        )
+
+        if hourly:
+            weather_url += "&hourly=temperature_2m,weather_code,precipitation_probability"
+
+        with urllib.request.urlopen(weather_url, timeout=10, context=ctx) as resp:
+            weather = json.loads(resp.read().decode())
+
+        # Weather code descriptions
+        weather_codes = {
+            0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+            45: "Foggy", 48: "Depositing rime fog",
+            51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+            61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+            71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
+            77: "Snow grains", 80: "Slight rain showers", 81: "Moderate rain showers",
+            82: "Violent rain showers", 85: "Slight snow showers", 86: "Heavy snow showers",
+            95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail"
+        }
+
+        current = weather.get("current", {})
+        daily = weather.get("daily", {})
+        hourly_data = weather.get("hourly", {})
+        units = weather.get("current_units", {})
+
+        # Format current weather
+        code = current.get("weather_code", 0)
+        condition = weather_codes.get(code, "Unknown")
+
+        output = [f"Weather for {name}:", ""]
+        output.append("CURRENT CONDITIONS:")
+        output.append(f"  {condition}")
+        output.append(f"  Temperature: {current.get('temperature_2m')}°{units.get('temperature_2m', 'F')}")
+        output.append(f"  Feels like: {current.get('apparent_temperature')}°{units.get('apparent_temperature', 'F')}")
+        output.append(f"  Humidity: {current.get('relative_humidity_2m')}%")
+        output.append(f"  Wind: {current.get('wind_speed_10m')} {units.get('wind_speed_10m', 'mph')}")
+
+        if current.get('precipitation', 0) > 0:
+            output.append(f"  Precipitation: {current.get('precipitation')} {units.get('precipitation', 'inch')}")
+
+        # Format forecast
+        if daily.get("time"):
+            output.append("")
+            output.append(f"FORECAST ({days} days):")
+            for i, date in enumerate(daily["time"]):
+                code = daily["weather_code"][i] if daily.get("weather_code") else 0
+                condition = weather_codes.get(code, "Unknown")
+                high = daily.get("temperature_2m_max", [None])[i]
+                low = daily.get("temperature_2m_min", [None])[i]
+                precip_prob = daily.get("precipitation_probability_max", [None])[i]
+
+                line = f"  {date}: {condition}, High {high}°, Low {low}°"
+                if precip_prob is not None and precip_prob > 0:
+                    line += f", {precip_prob}% chance of precipitation"
+                output.append(line)
+
+        # Format hourly if requested
+        if hourly and hourly_data.get("time"):
+            output.append("")
+            output.append(f"HOURLY FORECAST ({days} days):")
+            
+            current_date = None
+            
+            # Find closest start time or default to beginning
+            current_time_str = current.get("time") 
+            try:
+                start_idx = hourly_data["time"].index(current_time_str)
+            except (ValueError, KeyError):
+                start_idx = 0
+            
+            # Iterate through all available data from start_idx to the end
+            # Step by 3 to keep output concise (every 3 hours)
+            for i in range(start_idx, len(hourly_data["time"]), 3):
+                full_time_str = hourly_data["time"][i]
+                date_part, time_part = full_time_str.split("T")
+                
+                # Print date header when date changes
+                if date_part != current_date:
+                    output.append(f"  [{date_part}]")
+                    current_date = date_part
+                
+                temp = hourly_data["temperature_2m"][i]
+                code = hourly_data["weather_code"][i]
+                prob = hourly_data["precipitation_probability"][i]
+                cond = weather_codes.get(code, "Unknown")
+                
+                output.append(f"    {time_part}: {temp}°, {cond} ({prob}% precip)")
+
+        return "\n".join(output)
+
+    try:
+        # Run blocking HTTP calls in thread pool
+        result = await asyncio.get_event_loop().run_in_executor(None, fetch_weather)
+        return result
+    except Exception as e:
+        return f"Weather lookup failed: {str(e)}"
+
 async def log_extraction_to_context(extraction: Dict):
     """Log a summary of what was learned to recent_context.md."""
     if not extraction:
@@ -1395,7 +1575,8 @@ async def on_message(message: cl.Message):
         "read_file": read_file_tool,
         "update_file": update_file_tool,
         "search_files": search_files_tool,
-        "web_search": web_search_tool
+        "web_search": web_search_tool,
+        "get_weather": get_weather_tool
     }
 
     # Get session data

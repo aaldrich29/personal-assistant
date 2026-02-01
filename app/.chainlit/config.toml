@@ -1,11 +1,22 @@
 [project]
 session_timeout = 3600
+user_session_timeout = 1296000
 
 [UI]
 name = "Personal Assistant"
 custom_css = "./public/custom.css"
+default_theme = "dark"
+cot = "full"
 
 [features]
+edit_message = true
+latex = true
+
+[features.spontaneous_file_upload]
+enabled = true
+accept = ["*/*"]
+max_files = 5
+max_size_mb = 500
 
 [meta]
 generated_by = "1.3.0"
