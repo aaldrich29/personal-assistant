@@ -1,0 +1,11 @@
+[project]
+session_timeout = 3600
+
+[UI]
+name = "Personal Assistant"
+custom_css = "./public/custom.css"
+
+[features]
+
+[meta]
+generated_by = "1.3.0"
