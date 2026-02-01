@@ -86,6 +86,17 @@ services:
     networks:
       - assistant-net
 
+  vault-web:
+    image: ghcr.io/aaldrich29/personal-assistant-vault-web:main
+    container_name: assistant-vault-web
+    restart: unless-stopped
+    ports:
+      - 8081:8000
+    volumes:
+      - ./vault:/vault
+    networks:
+      - assistant-net
+
 networks:
   assistant-net:
     driver: bridge

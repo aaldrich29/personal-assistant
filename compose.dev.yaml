@@ -104,6 +104,19 @@ services:
       - 8080:8080
     networks:
       - assistant-net
+  # Custom Vault Editor
+  vault-web:
+    build:
+      context: ./vault-web
+      dockerfile: Dockerfile
+    container_name: assistant-vault-web
+    restart: unless-stopped
+    ports:
+      - 8081:8000
+    volumes:
+      - ./vault:/vault
+    networks:
+      - assistant-net
 networks:
   assistant-net:
     driver: bridge

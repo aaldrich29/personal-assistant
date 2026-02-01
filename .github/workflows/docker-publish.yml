@@ -25,7 +25,7 @@ jobs:
 
     strategy:
       matrix:
-        service: [chainlit, scheduler]
+        service: [chainlit, scheduler, vault-web]
         include:
           - service: chainlit
             context: ./app
@@ -35,6 +35,10 @@ jobs:
             context: ./scheduler
             dockerfile: ./scheduler/Dockerfile
             image_suffix: -scheduler
+          - service: vault-web
+            context: ./vault-web
+            dockerfile: ./vault-web/Dockerfile
+            image_suffix: -vault-web
 
     steps:
       - name: Checkout repository
