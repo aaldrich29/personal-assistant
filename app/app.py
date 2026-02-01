@@ -1285,6 +1285,7 @@ async def on_message(message: cl.Message):
     if unsupported_files:
         warning_msg = f"⚠️ I cannot process the following files (unsupported type): {', '.join(unsupported_files)}"
         await cl.Message(content=warning_msg).send()
+        return
 
     # Get semantic context from ChromaDB
     semantic_context = await get_semantic_context(message.content)
