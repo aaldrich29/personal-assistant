@@ -42,9 +42,9 @@ def auth_callback(username: str, password: str):
 VAULT_PATH = Path(os.environ.get("VAULT_PATH", "/vault"))
 CHROMA_HOST = os.environ.get("CHROMA_HOST", "chromadb")
 CHROMA_PORT = int(os.environ.get("CHROMA_PORT", 8000))
-LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemini-2.0-flash-001")
-SEARCH_MODEL = os.environ.get("SEARCH_MODEL", "google/gemini-2.0-flash-001:online")
-EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "google/gemini-2.0-flash-001")
+LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemini-3-flash-preview")
+SEARCH_MODEL = os.environ.get("SEARCH_MODEL", "google/gemini-3-flash-preview:online")
+EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "google/gemini-3-flash-preview")
 ICAL_URL = os.environ.get("ICAL_URL", "")
 
 

@@ -13,7 +13,8 @@ services:
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
       - VAULT_PATH=/vault
-      - LLM_MODEL=${LLM_MODEL:-google/gemini-3-flash-preview:online}
+      - LLM_MODEL=${LLM_MODEL:-google/gemini-3-flash-preview}
+      - SEARCH_MODEL=${SEARCH_MODEL:-google/gemini-3-flash-preview:online}
       - EXTRACTION_MODEL=${EXTRACTION_MODEL:-google/gemini-3-flash-preview}
       - ICAL_URL=${ICAL_URL:-}
       - TZ=${TZ:-}
