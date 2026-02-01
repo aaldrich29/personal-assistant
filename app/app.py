@@ -23,6 +23,19 @@ from openai import AsyncOpenAI
 import chromadb
 
 # ============================================================================
+# Authentication
+# ============================================================================
+AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "personal_assistant_vault")
+
+@cl.password_auth_callback
+def auth_callback(username: str, password: str):
+    """Authenticate the user."""
+    if (username, password) == (AUTH_USERNAME, AUTH_PASSWORD):
+        return cl.User(identifier=username, metadata={"role": "admin", "provider": "credentials"})
+    return None
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
@@ -537,16 +550,17 @@ def get_mime_type(file_path: str) -> str:
     }
     return mime_map.get(ext, 'application/octet-stream')
 
-async def process_uploaded_files(elements: List) -> tuple[List[Dict], List[str]]:
+async def process_uploaded_files(elements: List) -> tuple[List[Dict], List[str], List[str]]:
     """
     Process uploaded file elements and convert to base64 for the API.
-    Returns a tuple of (content_parts for API, file_descriptions for history).
+    Returns a tuple of (content_parts for API, file_descriptions for history, unsupported_files).
     """
     content_parts = []
     file_descriptions = []
+    unsupported_files = []
 
     if not elements:
-        return content_parts, file_descriptions
+        return content_parts, file_descriptions, unsupported_files
 
     for element in elements:
         try:
@@ -591,11 +605,13 @@ async def process_uploaded_files(elements: List) -> tuple[List[Dict], List[str]]
             else:
                 print(f"[FILE] Skipping unsupported file type: {file_name}")
                 file_descriptions.append(f"[Skipped unsupported file: {file_name}]")
+                unsupported_files.append(file_name)
 
         except Exception as e:
             print(f"[FILE] Error processing {element}: {e}")
+            unsupported_files.append(f"{file_name} (Error)")
 
-    return content_parts, file_descriptions
+    return content_parts, file_descriptions, unsupported_files
 
 def build_multimodal_content(text: str, file_parts: List[Dict]) -> Union[str, List[Dict]]:
     """
@@ -1263,7 +1279,12 @@ async def on_message(message: cl.Message):
     session_id = cl.user_session.get("session_id", "unknown")
 
     # Process any uploaded files
-    file_parts, file_descriptions = await process_uploaded_files(message.elements)
+    file_parts, file_descriptions, unsupported_files = await process_uploaded_files(message.elements)
+
+    # Notify user about unsupported files
+    if unsupported_files:
+        warning_msg = f"⚠️ I cannot process the following files (unsupported type): {', '.join(unsupported_files)}"
+        await cl.Message(content=warning_msg).send()
 
     # Get semantic context from ChromaDB
     semantic_context = await get_semantic_context(message.content)
@@ -1378,8 +1399,16 @@ async def on_message(message: cl.Message):
 
         except Exception as e:
             err_msg = f"I encountered an error: {str(e)}"
-            await response_message.update(content=err_msg)
+            response_message.content = err_msg
+            await response_message.update()
             full_response = err_msg
+            
+            # Remove the last message (the one that caused the error) from history
+            # so the user can retry without getting stuck.
+            if messages and messages[-1]["role"] == "user":
+                messages.pop()
+                cl.user_session.set("messages", messages)
+            
             break
 
     # Add final response to history

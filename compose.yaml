@@ -17,6 +17,9 @@ services:
       - OMP_NUM_THREADS=4
       - ORT_DISABLE_CPU_AFFINITY=1
       - TOKENIZERS_PARALLELISM=false
+      - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET}
+      - AUTH_USERNAME=${AUTH_USERNAME}
+      - AUTH_PASSWORD=${AUTH_PASSWORD}
     volumes:
       - ./vault:/vault
       - /etc/localtime:/etc/localtime:ro
@@ -76,7 +79,7 @@ services:
     image: rclone/rclone:latest
     container_name: assistant-webdav
     restart: unless-stopped
-    command: serve webdav /vault --addr 0.0.0.0:8080 --user ${WEBDAV_USER:-admin} --pass ${WEBDAV_PASS:-changeme} --dir-cache-time 0
+    command: serve webdav /vault --addr 0.0.0.0:8080 --user ${AUTH_USERNAME:-admin} --pass ${AUTH_PASSWORD:-changeme} --dir-cache-time 0
     volumes:
       - ./vault:/vault/Assistant
       - /etc/localtime:/etc/localtime:ro
@@ -92,6 +95,9 @@ services:
     restart: unless-stopped
     ports:
       - 8081:8000
+    environment:
+      - AUTH_USERNAME=${AUTH_USERNAME}
+      - AUTH_PASSWORD=${AUTH_PASSWORD}
     volumes:
       - ./vault:/vault
     networks:

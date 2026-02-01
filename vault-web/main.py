@@ -1,14 +1,31 @@
 import os
 import shutil
+import secrets
 from typing import List, Optional, Literal
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Depends, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 app = FastAPI()
 
+security = HTTPBasic()
+
 VAULT_PATH = "/vault"
+AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "personal_assistant_vault")
+
+def get_current_username(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = secrets.compare_digest(credentials.username, AUTH_USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, AUTH_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
 
 class FileContent(BaseModel):
     content: str
@@ -60,16 +77,19 @@ def build_file_tree(path: str):
             
     return item
 
+# Dependencies
+AuthDep = Depends(get_current_username)
+
 @app.get("/")
-async def read_root():
+async def read_root(username: str = AuthDep):
     return FileResponse("static/index.html")
 
 @app.get("/api/tree")
-async def get_tree():
+async def get_tree(username: str = AuthDep):
     return build_file_tree(VAULT_PATH)
 
 @app.get("/api/file/{file_path:path}")
-async def read_file(file_path: str):
+async def read_file(file_path: str, username: str = AuthDep):
     full_path = get_safe_path(file_path)
     if not os.path.exists(full_path):
         raise HTTPException(status_code=404, detail="File not found")
@@ -81,7 +101,7 @@ async def read_file(file_path: str):
     return {"content": content}
 
 @app.post("/api/file/{file_path:path}")
-async def save_file(file_path: str, file: FileContent):
+async def save_file(file_path: str, file: FileContent, username: str = AuthDep):
     full_path = get_safe_path(file_path)
     try:
         with open(full_path, "w", encoding="utf-8") as f:
@@ -91,7 +111,7 @@ async def save_file(file_path: str, file: FileContent):
     return {"status": "success"}
 
 @app.post("/api/create")
-async def create_item(req: CreateRequest):
+async def create_item(req: CreateRequest, username: str = AuthDep):
     full_path = get_safe_path(req.path)
     
     if os.path.exists(full_path):
@@ -110,7 +130,7 @@ async def create_item(req: CreateRequest):
     return {"status": "success"}
 
 @app.post("/api/rename")
-async def rename_item(req: RenameRequest):
+async def rename_item(req: RenameRequest, username: str = AuthDep):
     old_full = get_safe_path(req.old_path)
     new_full = get_safe_path(req.new_path)
     
@@ -126,7 +146,7 @@ async def rename_item(req: RenameRequest):
     return {"status": "success"}
 
 @app.delete("/api/delete/{file_path:path}")
-async def delete_item(file_path: str):
+async def delete_item(file_path: str, username: str = AuthDep):
     full_path = get_safe_path(file_path)
     
     if not os.path.exists(full_path):

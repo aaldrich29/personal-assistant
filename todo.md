@@ -1,3 +1,10 @@
-- [ ] Add user authenitication and conversation history to the chat. I'm ok with a single user, I just need auth so that we can have conversation history
-- [X] Add file handling. During conversation, if user uploads a file, I need it to be handled. Likely best case for now is to send the image or pdf to the AI, or other easily handled files. Ignore things that can't be handled.
+- [X] Add user authenitication and conversation history to the chat.
+- [X] Add file handling. During conversation, if user uploads a file, I need it to be handled.
 - [ ] Maybe give AI the ability to store the file and have it indexed.
+- [X] File handling or disallowing of other filestypes
+- [X] Simple markdown file editor
+- [ ] Allow editing of scheduler instructions, or adding customer instructions
+- [ ] MCP tool access?
+- [ ] Right now if I'm idle on chat and come back it will display message a second time - fix
+- [ ] Viewport is too tall on mobile
+- [ ] Save as PWA?
