@@ -9,15 +9,11 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
-      - VAULT_PATH=/vault
       - LLM_MODEL=${LLM_MODEL:-google/gemini-3-flash-preview}
       - SEARCH_MODEL=${SEARCH_MODEL:-google/gemini-3-flash-preview:online}
       - EXTRACTION_MODEL=${EXTRACTION_MODEL:-google/gemini-3-flash-preview}
       - ICAL_URL=${ICAL_URL:-}
       - TZ=${TZ:-}
-      - OMP_NUM_THREADS=4
-      - ORT_DISABLE_CPU_AFFINITY=1
-      - TOKENIZERS_PARALLELISM=false
       - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET}
       - AUTH_USERNAME=${AUTH_USERNAME}
       - AUTH_PASSWORD=${AUTH_PASSWORD}
@@ -37,7 +33,6 @@ services:
     container_name: assistant-chromadb
     restart: unless-stopped
     environment:
-      - CHROMA_SERVER_AUTHN_PROVIDER=
       - ANONYMIZED_TELEMETRY=FALSE
     volumes:
       - ./chromadb_data:/data
@@ -61,12 +56,8 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
-      - VAULT_PATH=/vault
       - LLM_MODEL=${LLM_MODEL:-google/gemini-3-flash-preview:online}
       - TZ=${TZ:-}
-      - OMP_NUM_THREADS=4
-      - ORT_DISABLE_CPU_AFFINITY=1
-      - TOKENIZERS_PARALLELISM=false
     volumes:
       - ./vault:/vault
       - /etc/localtime:/etc/localtime:ro

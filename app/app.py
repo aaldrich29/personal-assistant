@@ -362,6 +362,9 @@ _calendar_cache = {
 }
 CALENDAR_CACHE_MINUTES = 10  # Minimum time between iCal fetches
 
+# Track which conversations have already been greeted (by thread ID)
+_greeted_threads: set = set()
+
 
 def _calendar_needs_refresh() -> bool:
     """Check if calendar cache is stale without fetching."""
@@ -1311,9 +1314,13 @@ This file is automatically updated by the assistant as it learns patterns and pr
 @cl.on_chat_start
 async def on_chat_start():
     """Initialize chat session with context from vault."""
+    global _greeted_threads
 
     # Ensure vault is ready
     ensure_vault_setup()
+
+    # Get thread ID to track if we've already greeted this conversation
+    thread_id = cl.context.session.thread_id
 
     # Generate session ID
     session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -1325,7 +1332,7 @@ async def on_chat_start():
     if _calendar_needs_refresh():
         # Fire and forget - runs in background
         asyncio.create_task(asyncio.to_thread(refresh_calendar_if_needed))
-    
+
     # Fire off ChromaDB indexing in background as well
     # (Note: refresh_calendar_if_needed handles its own re-indexing, but if we didn't call it, we might need to check vault index)
     # The original code had logic for `index_task`, but simplistic fire-and-forget is better for UX here.
@@ -1337,6 +1344,13 @@ async def on_chat_start():
     # Build and store system context (pass pre-loaded files to avoid duplicate reads)
     system_context = build_system_context(learned_behaviors=learned, daily_prep=daily_prep)
     cl.user_session.set("system_context", system_context)
+
+    # Skip greeting if this conversation was already greeted (e.g., tab switch reconnection)
+    if thread_id in _greeted_threads:
+        return
+
+    # Mark this conversation as greeted
+    _greeted_threads.add(thread_id)
 
     # Use cached calendar for welcome message
     calendar = _calendar_cache["calendar_text_7day"]
