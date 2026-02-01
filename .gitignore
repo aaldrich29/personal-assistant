@@ -36,3 +36,6 @@ venv/
 
 # Docker
 .docker_data/
+
+# Data persistence
+data/

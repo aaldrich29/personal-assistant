@@ -23,6 +23,7 @@ services:
       - AUTH_PASSWORD=${AUTH_PASSWORD}
     volumes:
       - ./vault:/vault
+      - ./data:/data
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     depends_on:

@@ -19,8 +19,10 @@ import ssl
 from zoneinfo import ZoneInfo
 
 import chainlit as cl
+from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from openai import AsyncOpenAI
 import chromadb
+from sqlalchemy import create_engine, text
 
 # ============================================================================
 # Authentication
@@ -46,6 +48,115 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemini-3-flash-preview")
 SEARCH_MODEL = os.environ.get("SEARCH_MODEL", "google/gemini-3-flash-preview:online")
 EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "google/gemini-3-flash-preview")
 ICAL_URL = os.environ.get("ICAL_URL", "")
+
+# SQLite Database Configuration
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+SQLITE_DB_PATH = DATA_DIR / "chainlit.db"
+
+def init_sqlite_db():
+    """Initialize SQLite database with required schema for Chainlit data layer."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Use synchronous engine for schema creation
+    engine = create_engine(f"sqlite:///{SQLITE_DB_PATH}")
+
+    with engine.connect() as conn:
+        # Create users table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                "id" TEXT PRIMARY KEY,
+                "identifier" TEXT NOT NULL UNIQUE,
+                "metadata" TEXT NOT NULL DEFAULT '{}',
+                "createdAt" TEXT
+            )
+        """))
+
+        # Create threads table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS threads (
+                "id" TEXT PRIMARY KEY,
+                "createdAt" TEXT,
+                "name" TEXT,
+                "userId" TEXT,
+                "userIdentifier" TEXT,
+                "tags" TEXT,
+                "metadata" TEXT,
+                FOREIGN KEY ("userId") REFERENCES users("id") ON DELETE CASCADE
+            )
+        """))
+
+        # Create steps table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS steps (
+                "id" TEXT PRIMARY KEY,
+                "name" TEXT NOT NULL,
+                "type" TEXT NOT NULL,
+                "threadId" TEXT NOT NULL,
+                "parentId" TEXT,
+                "streaming" INTEGER NOT NULL,
+                "waitForAnswer" INTEGER,
+                "isError" INTEGER,
+                "metadata" TEXT,
+                "tags" TEXT,
+                "input" TEXT,
+                "output" TEXT,
+                "createdAt" TEXT,
+                "command" TEXT,
+                "start" TEXT,
+                "end" TEXT,
+                "generation" TEXT,
+                "showInput" TEXT,
+                "language" TEXT,
+                "indent" INTEGER,
+                "defaultOpen" INTEGER,
+                FOREIGN KEY ("threadId") REFERENCES threads("id") ON DELETE CASCADE
+            )
+        """))
+
+        # Create elements table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS elements (
+                "id" TEXT PRIMARY KEY,
+                "threadId" TEXT,
+                "type" TEXT,
+                "url" TEXT,
+                "chainlitKey" TEXT,
+                "name" TEXT NOT NULL,
+                "display" TEXT,
+                "objectKey" TEXT,
+                "size" TEXT,
+                "page" INTEGER,
+                "language" TEXT,
+                "forId" TEXT,
+                "mime" TEXT,
+                "props" TEXT,
+                FOREIGN KEY ("threadId") REFERENCES threads("id") ON DELETE CASCADE
+            )
+        """))
+
+        # Create feedbacks table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS feedbacks (
+                "id" TEXT PRIMARY KEY,
+                "forId" TEXT NOT NULL,
+                "threadId" TEXT NOT NULL,
+                "value" INTEGER NOT NULL,
+                "comment" TEXT,
+                FOREIGN KEY ("threadId") REFERENCES threads("id") ON DELETE CASCADE
+            )
+        """))
+
+        conn.commit()
+
+    print(f"[DB] SQLite database initialized at {SQLITE_DB_PATH}")
+
+# Initialize the database on module load
+init_sqlite_db()
+
+@cl.data_layer
+def get_data_layer():
+    """Return the SQLAlchemy data layer for Chainlit persistence."""
+    return SQLAlchemyDataLayer(conninfo=f"sqlite+aiosqlite:///{SQLITE_DB_PATH}")
 
 
 def get_local_timezone() -> ZoneInfo:
