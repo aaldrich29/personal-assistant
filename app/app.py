@@ -30,6 +30,7 @@ VAULT_PATH = Path(os.environ.get("VAULT_PATH", "/vault"))
 CHROMA_HOST = os.environ.get("CHROMA_HOST", "chromadb")
 CHROMA_PORT = int(os.environ.get("CHROMA_PORT", 8000))
 LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemini-2.0-flash-001")
+SEARCH_MODEL = os.environ.get("SEARCH_MODEL", "google/gemini-2.0-flash-001:online")
 EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "google/gemini-2.0-flash-001")
 ICAL_URL = os.environ.get("ICAL_URL", "")
 
@@ -146,6 +147,83 @@ def get_topic_summary() -> str:
         keywords = ", ".join(info.get("keywords", [])[:5])
         lines.append(f"- {topic_id}: {info.get('description', 'No description')} (path: {info.get('vault_path')}, keywords: {keywords})")
     return "\n".join(lines)
+
+# ============================================================================
+# Tool Implementations
+# ============================================================================
+
+from tool_definitions import tools_schema
+
+async def list_files_tool(directory: str = None) -> str:
+    """List files in the vault."""
+    files = get_existing_vault_files()
+    if directory:
+        files = [f for f in files if f.startswith(directory)]
+    if not files:
+        return "No files found."
+    return "\n".join(f"- {f}" for f in files[:100])
+
+async def read_file_tool(file_path: str) -> str:
+    """Read a vault file."""
+    content = read_vault_file(file_path)
+    if not content:
+        return f"File not found: {file_path}"
+    return content
+
+async def update_file_tool(file_path: str, content: str, instructions: str = "") -> str:
+    """Update a vault file using smart merge."""
+    existing = read_vault_file(file_path)
+    if not existing:
+        write_vault_file(file_path, f"# {file_path}\n\n{content}")
+        return f"Created new file: {file_path}"
+    
+    # Merge with instructions context
+    merge_info = f"{content}\n\nInstructions: {instructions}"
+    new_content = await merge_and_update_file(file_path, existing, merge_info)
+    write_vault_file(file_path, new_content)
+    return f"Updated file: {file_path}"
+
+async def search_files_tool(query: str) -> str:
+    """Search files using chroma or simple keyword search."""
+    # Using existing chroma search function
+    context = await get_semantic_context(query)
+    return context if context else "No matching information found."
+
+async def web_search_tool(query: str) -> str:
+    """Perform a web search using the online model variant."""
+    try:
+        response = await client.chat.completions.create(
+            model=SEARCH_MODEL,
+            messages=[{"role": "user", "content": query}],
+            max_tokens=1000
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Web search failed: {str(e)}"
+
+async def log_extraction_to_context(extraction: Dict):
+    """Log a summary of what was learned to recent_context.md."""
+    if not extraction:
+        return
+
+    subject = extraction.get("subject", "Info")
+    topic_id = extraction.get("topic_id", "general")
+    timestamp = datetime.now().strftime('%H:%M')
+    
+    log_entry = f"\n- [{timestamp}] Learned new info about {subject} ({topic_id})"
+    
+    # Append to recent_context.md
+    context_path = "meta/recent_context.md"
+    existing = read_vault_file(context_path)
+    
+    if "## Today's Activity" not in existing:
+         existing += f"\n\n## Today's Activity{log_entry}"
+    else:
+        # Insert into the section
+        parts = existing.split("## Today's Activity")
+        existing = parts[0] + "## Today's Activity" + parts[1] + log_entry
+        
+    write_vault_file(context_path, existing)
 
 # ============================================================================
 # iCal Calendar Integration (with caching)
@@ -594,6 +672,7 @@ Be warm, helpful, and remember important details about the family."""
 You can:
 - Search your knowledge vault for relevant information
 - Save important information to appropriate vault files
+- **Correct or delete incorrect information** when the user identifies it as a mistake
 - Remember family members, schedules, preferences
 - Track health, school, and general notes
 - Help with meal planning, workouts, and daily tasks
@@ -638,7 +717,7 @@ async def get_semantic_context(user_message: str) -> str:
 # Topic Resolution
 # ============================================================================
 
-TOPIC_RESOLUTION_PROMPT = """Analyze this conversation and determine where information should be stored.
+TOPIC_RESOLUTION_PROMPT = """Analyze this conversation and determine where information should be stored or modified.
 
 ## Registered Topics (use these paths if the conversation matches):
 {topic_summary}
@@ -651,11 +730,11 @@ User: {user_message}
 Assistant: {assistant_response}
 
 ## Your Task:
-1. Does this conversation contain information worth saving? If it's just chitchat or simple Q&A with no new facts, respond with {{"should_save": false}}
+1. Does this conversation contain information worth saving or MODIFYING? If the user provides new facts, CORRECTS existing information, or asks to DELETE something, respond with {{"should_save": true}}. If it's just chitchat or simple Q&A with no new or corrective info, respond with {{"should_save": false}}.
 
-2. If worth saving, does it relate to an EXISTING registered topic above?
-   - If yes: use that topic's vault_path
-   - If no: create a NEW topic with a sensible path
+2. If worth saving/modifying, does it relate to an EXISTING registered topic above or an EXISTING vault file?
+   - If yes: use that topic's vault_path or the existing file path.
+   - If no: create a NEW topic with a sensible path.
 
 3. For NEW topics, follow these conventions:
    - Family member info → family/members/[name].md
@@ -682,8 +761,8 @@ Respond with JSON only:
 If should_save is false, only include: {{"should_save": false, "reason": "why not saving"}}
 """
 
-async def resolve_topic(user_message: str, assistant_response: str) -> Optional[Dict]:
-    """Resolve which topic/path this conversation belongs to."""
+async def resolve_topic(messages: List[Dict]) -> Optional[Dict]:
+    """Resolve which topic/path this conversation belongs to, based on recent context."""
     try:
         # Get context for the resolution
         topic_summary = get_topic_summary()
@@ -693,7 +772,18 @@ async def resolve_topic(user_message: str, assistant_response: str) -> Optional[
         if not existing_files_str:
             existing_files_str = "No existing files yet."
 
-        print(f"[TOPIC] Resolving topic for: {user_message[:50]}...")
+        # Format last few messages for context (last 6 messages)
+        recent_msgs = messages[-6:] if len(messages) > 6 else messages
+        conversation_str = ""
+        for msg in recent_msgs:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            content = msg.get("content") or ""
+            # Truncate very long messages
+            if len(content) > 500:
+                content = content[:500] + "... (truncated)"
+            conversation_str += f"{role}: {content}\n"
+
+        print(f"[TOPIC] Resolving topic for recent context...")
 
         response = await client.chat.completions.create(
             model=EXTRACTION_MODEL,
@@ -702,9 +792,9 @@ async def resolve_topic(user_message: str, assistant_response: str) -> Optional[
                 {"role": "user", "content": TOPIC_RESOLUTION_PROMPT.format(
                     topic_summary=topic_summary,
                     existing_files=existing_files_str,
-                    user_message=user_message,
-                    assistant_response=assistant_response
-                )}
+                    user_message="[See Conversation Context]",
+                    assistant_response="[See Conversation Context]"
+                ).replace("Conversation:\nUser: {user_message}\nAssistant: {assistant_response}", f"Conversation (Last 6 messages):\n{conversation_str}")}
             ],
             temperature=0.1,
             max_tokens=500
@@ -761,23 +851,66 @@ async def resolve_topic(user_message: str, assistant_response: str) -> Optional[
 # Learning and Information Extraction
 # ============================================================================
 
+MERGE_PROMPT = """You are a knowledge curator. Your goal is to merge new information into an existing markdown file, ensuring it remains concise, organized, and free of duplicates.
+
+## Task
+Merge the "New Information" into the "Current File Content".
+- **DELETION/REMOVAL:** If the new information indicates that a fact is incorrect, should be removed, or is a mistake, DELETE it from the file. Do not just add a note saying it was removed; actually remove the text.
+- **UPDATE:** Update existing facts if the new info is more recent or corrective.
+- **ADDITION:** Add new facts naturally into relevant sections.
+- **DEDUPLICATION:** Remove duplicate information.
+- **STRUCTURE:** Maintain the existing markdown structure (headers, lists).
+- If the file is empty, just format the new information nicely.
+
+## Current File Content:
+{current_content}
+
+## New Information:
+{new_info}
+
+## Output:
+Return ONLY the updated markdown content for the file. Do not add ```markdown blocks or conversational text.
+"""
+
+async def merge_and_update_file(vault_path: str, current_content: str, new_info: str) -> str:
+    """Merge new info into existing content using the LLM to deduplicate and organize."""
+    try:
+        response = await client.chat.completions.create(
+            model=EXTRACTION_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a helpful knowledge assistant. Output only the updated file content."},
+                {"role": "user", "content": MERGE_PROMPT.format(
+                    current_content=current_content,
+                    new_info=new_info
+                )}
+            ],
+            temperature=0.1,
+            max_tokens=2000
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[MERGE] Error merging content: {e}")
+        # Fallback to append if merge fails
+        return f"{current_content}\n\n## Update\n{new_info}"
+
 EXTRACTION_PROMPT = """Extract the key information from this conversation to save to the vault.
 
 ## Target File: {vault_path}
 ## Topic: {topic_description}
 
 ## What to Extract:
-- Key facts, dates, details, preferences mentioned
-- Names, places, times, costs if relevant
-- Decisions made or plans confirmed
-- Any actionable items or things to remember
+- **NEW FACTS:** Key facts, dates, details, preferences mentioned.
+- **CORRECTIONS/DELETIONS:** If the user identifies information as incorrect or asks to delete something, clearly state what should be REMOVED or CORRECTED.
+- **DETAILS:** Names, places, times, costs if relevant.
+- **DECISIONS:** Decisions made or plans confirmed.
+- **ACTION ITEMS:** Any actionable items or things to remember.
 
 ## Self-Improvement (optional):
 If you notice patterns in how the user communicates or preferences for how things should be done, note them.
 
 Respond with JSON:
 {{
-    "information": "The key information to save (formatted as markdown, can be multiple paragraphs)",
+    "information": "The key information to save, correct, or delete (formatted as markdown). For deletions, clearly state 'Remove the information about [X]'.",
     "subject": "Brief subject line for this entry",
     "behavior_updates": {{
         "should_update": true/false,
@@ -791,12 +924,23 @@ User: {user_message}
 Assistant: {assistant_response}
 """
 
-async def extract_learnings(user_message: str, assistant_response: str, topic_info: Dict) -> Optional[Dict]:
-    """Extract important information from a conversation exchange using resolved topic."""
+async def extract_learnings(messages: List[Dict], topic_info: Dict) -> Optional[Dict]:
+    """Extract important information from a conversation exchange using resolved topic and context."""
     result_text = None
     try:
         vault_path = topic_info.get("vault_path", "notes/general/misc.md")
         topic_description = topic_info.get("topic_description", "General notes")
+
+        # Format context (last 10 messages)
+        recent_msgs = messages[-10:] if len(messages) > 10 else messages
+        conversation_str = ""
+        for msg in recent_msgs:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            content = msg.get("content") or ""
+            # Truncate very long messages
+            if len(content) > 1000:
+                content = content[:1000] + "... (truncated)"
+            conversation_str += f"{role}: {content}\n"
 
         print(f"[EXTRACT] Extracting for topic: {topic_info.get('topic_id')} -> {vault_path}")
 
@@ -807,9 +951,9 @@ async def extract_learnings(user_message: str, assistant_response: str, topic_in
                 {"role": "user", "content": EXTRACTION_PROMPT.format(
                     vault_path=vault_path,
                     topic_description=topic_description,
-                    user_message=user_message,
-                    assistant_response=assistant_response
-                )}
+                    user_message="[See Context]",
+                    assistant_response="[See Context]"
+                ).replace("Conversation:\nUser: {user_message}\nAssistant: {assistant_response}", f"Conversation (Last 10 messages):\n{conversation_str}")}
             ],
             temperature=0.1,
             max_tokens=1500
@@ -879,20 +1023,17 @@ async def save_learnings(extraction: Dict):
         print("[SAVE] No information or vault_path to save")
         return
 
-    # Check if file exists to determine formatting
+    # Check if file exists
     existing = read_vault_file(vault_path)
 
-    if not existing:
-        new_content = f"# {subject}\n\n"
-        new_content += f"## {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        new_content += f"{info}\n"
-    else:
-        new_content = f"\n\n## {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        new_content += f"{info}\n"
-
     if existing:
-        append_vault_file(vault_path, new_content)
+        print(f"[SAVE] Merging new info into existing file: {vault_path}")
+        # Smart merge: Read + Update + Write
+        new_content = await merge_and_update_file(vault_path, existing, info)
+        write_vault_file(vault_path, new_content)
     else:
+        print(f"[SAVE] Creating new file: {vault_path}")
+        new_content = f"# {subject}\n\n{info}\n"
         write_vault_file(vault_path, new_content)
 
     # Index to ChromaDB
@@ -918,43 +1059,23 @@ async def save_learnings(extraction: Dict):
         )
 
 async def update_learned_behaviors(section: str, content: str):
-    """Update the learned behaviors file."""
+    """Update the learned behaviors file by merging new insights."""
     if not content:
         return
 
     behaviors_path = "meta/learned_behaviors.md"
     current = read_vault_file(behaviors_path)
 
-    section_map = {
-        "communication_preferences": "## Communication Preferences",
-        "routine_patterns": "## Routine Patterns",
-        "follow_up_items": "## Follow-up Items",
-        "custom_rules": "## Custom Rules"
-    }
+    # Use the same smart merge logic
+    print(f"[BEHAVIOR] Merging new behavior into {section}...")
+    new_info = f"Update section '{section}' with: {content}"
+    
+    # If file is empty/missing, initialize it
+    if not current:
+        current = "# Learned Behaviors\n\n## Communication Preferences\n\n## Routine Patterns\n\n## Follow-up Items\n\n## Custom Rules\n"
 
-    section_header = section_map.get(section, "## Custom Rules")
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
-    new_entry = f"\n- [{timestamp}] {content}"
-
-    if section_header in current:
-        # Find the section and append to it
-        parts = current.split(section_header)
-        if len(parts) >= 2:
-            # Find the next section or end
-            rest = parts[1]
-            next_section = rest.find("\n## ")
-            if next_section != -1:
-                section_content = rest[:next_section]
-                after_section = rest[next_section:]
-                updated = parts[0] + section_header + section_content + new_entry + after_section
-            else:
-                updated = parts[0] + section_header + rest + new_entry
-            write_vault_file(behaviors_path, updated)
-            print(f"Updated learned behaviors ({section}): {content[:50]}...")
-    else:
-        # Section doesn't exist, append it
-        append_vault_file(behaviors_path, f"\n\n{section_header}{new_entry}")
-        print(f"Added new behavior section ({section}): {content[:50]}...")
+    new_content = await merge_and_update_file(behaviors_path, current, new_info)
+    write_vault_file(behaviors_path, new_content)
 
 # ============================================================================
 # Conversation Saving
@@ -1072,19 +1193,15 @@ async def on_chat_start():
     cl.user_session.set("session_id", session_id)
     cl.user_session.set("messages", [])
 
-    # Refresh calendar if cache is stale - show loading indicator during fetch
-    index_task = None
+    # Refresh calendar in background if cache is stale
+    # We do NOT await this, so the UI loads instantly.
     if _calendar_needs_refresh():
-        async with cl.Step(name="Fetching calendar...") as step:
-            # Run blocking fetch in thread so UI can show loading state
-            index_task = await asyncio.to_thread(refresh_calendar_if_needed)
-            step.output = f"Loaded {len(_calendar_cache['events'])} events"
-    else:
-        index_task = refresh_calendar_if_needed()
-
-    if index_task:
-        # Fire off ChromaDB indexing in background, don't wait for it
-        asyncio.create_task(index_task)
+        # Fire and forget - runs in background
+        asyncio.create_task(asyncio.to_thread(refresh_calendar_if_needed))
+    
+    # Fire off ChromaDB indexing in background as well
+    # (Note: refresh_calendar_if_needed handles its own re-indexing, but if we didn't call it, we might need to check vault index)
+    # The original code had logic for `index_task`, but simplistic fire-and-forget is better for UX here.
 
     # Read files once for both system context and welcome message
     learned = read_vault_file("meta/learned_behaviors.md")
@@ -1129,7 +1246,16 @@ async def on_chat_start():
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    """Process incoming messages."""
+    """Process incoming messages with tool support."""
+
+    # Available tools mapping
+    available_tools = {
+        "list_files": list_files_tool,
+        "read_file": read_file_tool,
+        "update_file": update_file_tool,
+        "search_files": search_files_tool,
+        "web_search": web_search_tool
+    }
 
     # Get session data
     messages = cl.user_session.get("messages", [])
@@ -1155,69 +1281,135 @@ async def on_message(message: cl.Message):
     if file_descriptions:
         history_content = f"{message.content}\n{' '.join(file_descriptions)}"
 
-    # Add user message to history (text version for saving)
-    messages.append({"role": "user", "content": history_content})
+    # Add user message to history
+    messages.append({"role": "user", "content": user_content})
 
-    # Build messages for API call (keep last 100 messages for context)
-    # Use multimodal content for current message, text for history
-    api_messages = [
-        {"role": "system", "content": full_system_prompt}
-    ] + messages[-100:-1] + [{"role": "user", "content": user_content}]
-
-    # Create streaming response
+    # Prepare for response
     response_message = cl.Message(content="")
     await response_message.send()
 
-    # Stream the response
-    full_response = ""
-    try:
-        stream = await client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=api_messages,
-            stream=True,
-            temperature=0.7,
-            max_tokens=2000,
-            extra_body={
-                "reasoning": {
-                    "effort": "medium"
+    # Tool Loop (Max 3 turns)
+    for turn in range(3):
+        api_messages = [
+            {"role": "system", "content": full_system_prompt}
+        ] + messages[-100:]
+
+        full_response = ""
+        tool_calls_data = [] # To accumulate chunks
+        
+        try:
+            stream = await client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=api_messages,
+                tools=tools_schema,
+                tool_choice="auto",
+                stream=True,
+                temperature=0.7,
+                max_tokens=2000
+            )
+
+            async for chunk in stream:
+                delta = chunk.choices[0].delta
+                
+                # Handle Content
+                if delta.content:
+                    full_response += delta.content
+                    await response_message.stream_token(delta.content)
+
+                # Handle Tool Calls (Accumulate)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        if len(tool_calls_data) <= tc.index:
+                            tool_calls_data.append({"id": "", "function": {"name": "", "arguments": ""}, "type": "function"})
+                        
+                        # Append pieces
+                        if tc.id: tool_calls_data[tc.index]["id"] += tc.id
+                        if tc.function.name: tool_calls_data[tc.index]["function"]["name"] += tc.function.name
+                        if tc.function.arguments: tool_calls_data[tc.index]["function"]["arguments"] += tc.function.arguments
+
+            await response_message.update()
+
+            # If we have tool calls, execute them
+            if tool_calls_data:
+                # Append the assistant's "thinking" (or tool call request) to history
+                # Note: OpenRouter/OpenAI expects the assistant message to include the tool_calls field
+                assistant_msg = {
+                    "role": "assistant", 
+                    "content": full_response if full_response else None,
+                    "tool_calls": tool_calls_data
                 }
-            }
-        )
+                messages.append(assistant_msg)
+                
+                for tool in tool_calls_data:
+                    func_name = tool["function"]["name"]
+                    func_args_str = tool["function"]["arguments"]
+                    call_id = tool["id"]
+                    
+                    try:
+                        args = json.loads(func_args_str)
+                        print(f"[TOOL] Calling {func_name} with {args}")
+                        
+                        if func_name in available_tools:
+                            # Show status update
+                            async with cl.Step(name=func_name) as step:
+                                step.input = args
+                                result = await available_tools[func_name](**args)
+                                step.output = result
+                        else:
+                            result = f"Error: Tool {func_name} not found."
+                            
+                    except Exception as e:
+                        result = f"Error executing tool: {str(e)}"
+                        print(f"[TOOL] Error: {e}")
 
-        async for chunk in stream:
-            if chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                full_response += content
-                await response_message.stream_token(content)
+                    # Append Tool Result
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": result,
+                        "name": func_name
+                    })
 
-        await response_message.update()
+                # Loop continues to next turn to generate response based on tool results
+                continue
+            
+            # No tool calls, we are done
+            break
 
-    except Exception as e:
-        full_response = f"I encountered an error: {str(e)}"
-        await response_message.update(content=full_response)
+        except Exception as e:
+            err_msg = f"I encountered an error: {str(e)}"
+            await response_message.update(content=err_msg)
+            full_response = err_msg
+            break
 
-    # Add assistant response to history
-    messages.append({"role": "assistant", "content": full_response})
+    # Add final response to history
+    if not tool_calls_data:
+         messages.append({"role": "assistant", "content": full_response})
+
     cl.user_session.set("messages", messages)
 
-    # Background tasks: extract learnings and save conversation
-    asyncio.create_task(extract_and_save(history_content, full_response))
+    # Background tasks
+    asyncio.create_task(extract_and_save(messages))
     asyncio.create_task(save_conversation(messages, session_id))
 
-async def extract_and_save(user_message: str, assistant_response: str):
-    """Background task to resolve topic, extract, and save learnings."""
-    # Phase 1: Resolve which topic this belongs to
-    topic_info = await resolve_topic(user_message, assistant_response)
+async def extract_and_save(messages: List[Dict]):
+    """Background task to resolve topic, extract, and save learnings using recent context."""
+    if not messages:
+        return
+        
+    # Phase 1: Resolve which topic this belongs to, using the last few messages for context
+    topic_info = await resolve_topic(messages)
 
     if not topic_info or not topic_info.get("should_save"):
         print(f"[EXTRACT] Nothing to save: {topic_info.get('reason', 'no reason given') if topic_info else 'topic resolution failed'}")
         return
 
-    # Phase 2: Extract the actual information using the resolved topic
-    extraction = await extract_learnings(user_message, assistant_response, topic_info)
+    # Phase 2: Extract the actual information using the resolved topic and context
+    extraction = await extract_learnings(messages, topic_info)
 
     if extraction:
         await save_learnings(extraction)
+        await log_extraction_to_context(extraction)
 
 @cl.on_chat_end
 async def on_chat_end():

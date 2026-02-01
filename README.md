@@ -9,6 +9,8 @@ A self-hosted, private AI assistant that learns from your conversations and mana
 *   **🧠 Long-term Memory**: Uses a local Markdown "Vault" and ChromaDB vector search to remember facts, preferences, and family details forever.
 *   **🗣️ Natural Conversation**: Built on Chainlit, supporting fluid chat and file uploads.
 *   **📅 Calendar Integration**: Reads your iCal feed to brief you on your day.
+*   **🌐 Web Search**: Can search the live web for news, weather, or facts using a delegated search tool.
+*   **👁️ Vision Support**: Understands uploaded images, screenshots, and documents (PDFs).
 *   **🔄 Self-Learning**: Automatically extracts and saves new information (preferences, events, health notes) to its vault in the background.
 *   **📝 Obsidian Sync**: The vault is just a folder of Markdown files. Sync it with Obsidian (via WebDAV) to view and edit your assistant's brain directly.
 *   **🔒 Privacy First**: All data is stored locally. The only external traffic is to the LLM provider (OpenRouter).
@@ -55,8 +57,11 @@ You don't need to clone the full repository to run the assistant. You just need 
     *   Rename `.env.example` to `.env`.
     *   Open `.env` in a text editor.
     *   **Required**: Paste your `OPENROUTER_API_KEY`.
+    *   **Models**: The assistant uses a split model approach:
+        *   `LLM_MODEL`: Used for standard chat (Default: `google/gemini-3-flash-preview`).
+        *   `SEARCH_MODEL`: Used for online web searches (Default: `:online` variant).
     *   **Recommended**: Change the `WEBDAV_PASS` to secure your vault.
-    *   **Optional**: Add your `ICAL_URL` if you want calendar integration.
+    *   **Optional**: Add your `ICAL_URL` and set your `TZ` (Timezone, e.g., `America/Chicago`).
 
 ### 2. Run
 

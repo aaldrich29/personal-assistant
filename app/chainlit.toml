@@ -1,0 +1,12 @@
+[project]
+name = "Personal Assistant"
+
+[UI]
+# Name of the assistant (displayed in the UI)
+name = "Personal Assistant"
+# Path to custom CSS file
+custom_css = "./public/custom.css"
+
+[features]
+# content of the markdown file to be displayed on the chat start
+markdown = "chainlit.md"
