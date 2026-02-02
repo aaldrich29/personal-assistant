@@ -1824,3 +1824,38 @@ async def on_chat_end():
     # Final save of conversation
     if messages:
         await save_conversation(messages, session_id)
+
+@cl.on_chat_resume
+async def on_chat_resume(thread: dict):
+    """Handle resuming a previous chat session."""
+    global _greeted_threads
+
+    # Ensure vault is ready
+    ensure_vault_setup()
+
+    # Mark this thread as already greeted (don't send welcome message again)
+    thread_id = thread.get("id")
+    if thread_id:
+        _greeted_threads.add(thread_id)
+
+    # Restore messages from thread history
+    messages = []
+    for step in thread.get("steps", []):
+        step_type = step.get("type")
+        output = step.get("output", "")
+
+        if step_type == "user_message":
+            messages.append({"role": "user", "content": output})
+        elif step_type == "assistant_message":
+            messages.append({"role": "assistant", "content": output})
+
+    # Generate session ID for this resumed session
+    session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_resumed"
+    cl.user_session.set("session_id", session_id)
+    cl.user_session.set("messages", messages)
+
+    # Build and store system context
+    system_context = build_system_context()
+    cl.user_session.set("system_context", system_context)
+
+    print(f"[RESUME] Resumed thread {thread_id} with {len(messages)} messages")
