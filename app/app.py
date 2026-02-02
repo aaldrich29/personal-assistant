@@ -234,11 +234,15 @@ def get_existing_vault_files() -> List[str]:
 # ============================================================================
 
 def read_topic_registry() -> Dict:
-    """Read the topic registry, return empty dict if not found."""
+    """Read the topic registry, return dict with topics key if not found."""
     content = read_vault_file(TOPIC_REGISTRY_PATH)
     if content:
         try:
-            return json.loads(content)
+            registry = json.loads(content)
+            # Ensure topics key exists
+            if "topics" not in registry:
+                registry["topics"] = {}
+            return registry
         except json.JSONDecodeError:
             print("[REGISTRY] Failed to parse topic registry, returning empty")
             return {"topics": {}}
@@ -248,9 +252,11 @@ def write_topic_registry(registry: Dict) -> None:
     """Write the topic registry to the vault."""
     write_vault_file(TOPIC_REGISTRY_PATH, json.dumps(registry, indent=2))
 
-def register_topic(topic_id: str, description: str, vault_path: str, keywords: List[str]) -> None:
-    """Register a new topic in the registry."""
+def register_topic(topic_id: str, description: str, vault_path: str, keywords: List[str]) -> bool:
+    """Register a topic in the registry if not already present. Returns True if registered."""
     registry = read_topic_registry()
+    if topic_id in registry.get("topics", {}):
+        return False  # Already registered
     registry["topics"][topic_id] = {
         "description": description,
         "vault_path": vault_path,
@@ -259,6 +265,56 @@ def register_topic(topic_id: str, description: str, vault_path: str, keywords: L
     }
     write_topic_registry(registry)
     print(f"[REGISTRY] Registered new topic: {topic_id} -> {vault_path}")
+    return True
+
+def initialize_topic_registry() -> int:
+    """Scan existing vault files and add them to the topic registry. Returns count of new topics."""
+    registry = read_topic_registry()
+    existing_topics = set(registry.get("topics", {}).keys())
+    existing_paths = {info.get("vault_path") for info in registry.get("topics", {}).values()}
+
+    vault_files = get_existing_vault_files()
+    added = 0
+
+    for file_path in vault_files:
+        # Skip if this path is already registered
+        if file_path in existing_paths:
+            continue
+
+        # Generate topic_id from path (e.g., "family/members/john.md" -> "family_members_john")
+        topic_id = file_path.replace("/", "_").replace(".md", "").replace(" ", "_").lower()
+
+        # Skip if topic_id already exists
+        if topic_id in existing_topics:
+            continue
+
+        # Generate description from path
+        parts = file_path.replace(".md", "").split("/")
+        if len(parts) > 1:
+            description = f"{parts[-1].replace('_', ' ').title()} ({parts[0]})"
+        else:
+            description = parts[0].replace("_", " ").title()
+
+        # Extract keywords from path
+        keywords = [p.replace("_", " ").lower() for p in parts]
+
+        registry["topics"][topic_id] = {
+            "description": description,
+            "vault_path": file_path,
+            "keywords": keywords,
+            "created": datetime.now().isoformat(),
+            "auto_indexed": True
+        }
+        existing_topics.add(topic_id)
+        existing_paths.add(file_path)
+        added += 1
+        print(f"[REGISTRY] Auto-indexed: {topic_id} -> {file_path}")
+
+    if added > 0:
+        write_topic_registry(registry)
+        print(f"[REGISTRY] Added {added} existing files to topic registry")
+
+    return added
 
 def get_topic_summary() -> str:
     """Get a summary of registered topics for the LLM."""
@@ -1005,6 +1061,11 @@ When you notice patterns in how the user likes things done, or learn new rules t
 
 When you learn something important, naturally acknowledge it. Be warm and conversational.
 """
+
+    # Add topic summary (knowledge index)
+    topic_summary = get_topic_summary()
+    system_prompt += f"\n# Knowledge Index (Topics you know about)\n{topic_summary}\n"
+
     return system_prompt
 
 async def get_semantic_context(user_message: str) -> str:
@@ -1140,8 +1201,8 @@ async def resolve_topic(messages: List[Dict]) -> Optional[Dict]:
         parsed = json.loads(result_text)
         print(f"[TOPIC] Resolved: should_save={parsed.get('should_save')}, topic={parsed.get('topic_id')}, path={parsed.get('vault_path')}")
 
-        # Register new topic if needed
-        if parsed.get("should_save") and parsed.get("is_new_topic"):
+        # Register topic if not already in registry (regardless of is_new_topic flag)
+        if parsed.get("should_save") and parsed.get("topic_id"):
             register_topic(
                 topic_id=parsed.get("topic_id", "unknown"),
                 description=parsed.get("topic_description", ""),
@@ -1490,6 +1551,9 @@ This file is automatically updated by the assistant as it learns patterns and pr
         if not file_path.exists():
             print(f"[INIT] Creating default vault file: {path}")
             write_vault_file(path, content)
+
+    # Initialize topic registry from existing vault files
+    initialize_topic_registry()
 
 @cl.on_chat_start
 async def on_chat_start():
