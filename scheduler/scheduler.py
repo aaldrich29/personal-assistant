@@ -24,7 +24,7 @@ import chromadb
 VAULT_PATH = Path(os.environ.get("VAULT_PATH", "/vault"))
 CHROMA_HOST = os.environ.get("CHROMA_HOST", "chromadb")
 CHROMA_PORT = int(os.environ.get("CHROMA_PORT", 8000))
-LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemini-2.0-flash-001")
+LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemini-3-flash-preview")
 
 client = OpenAI(
     api_key=os.environ.get("OPENROUTER_API_KEY"),
@@ -237,11 +237,7 @@ Keep it concise but comprehensive. Focus on actionable information."""
             ],
             temperature=0.3,
             max_tokens=2500,
-            extra_body={
-                "reasoning": {
-                    "effort": "medium"
-                }
-            }
+            extra_body={"reasoning_effort": "medium"}
         )
 
         recap_content = response.choices[0].message.content

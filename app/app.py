@@ -1168,7 +1168,8 @@ async def resolve_topic(messages: List[Dict]) -> Optional[Dict]:
                 ).replace("Conversation:\nUser: {user_message}\nAssistant: {assistant_response}", f"Conversation (Last 6 messages):\n{conversation_str}")}
             ],
             temperature=0.1,
-            max_tokens=500
+            max_tokens=500,
+            extra_body={"reasoning_effort": "low"}
         )
 
         result_text = response.choices[0].message.content
@@ -1256,7 +1257,8 @@ async def merge_and_update_file(vault_path: str, current_content: str, new_info:
                 )}
             ],
             temperature=0.1,
-            max_tokens=2000
+            max_tokens=2000,
+            extra_body={"reasoning_effort": "low"}
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -1327,7 +1329,8 @@ async def extract_learnings(messages: List[Dict], topic_info: Dict) -> Optional[
                 ).replace("Conversation:\nUser: {user_message}\nAssistant: {assistant_response}", f"Conversation (Last 10 messages):\n{conversation_str}")}
             ],
             temperature=0.1,
-            max_tokens=1500
+            max_tokens=1500,
+            extra_body={"reasoning_effort": "low"}
         )
 
         result_text = response.choices[0].message.content
@@ -1697,7 +1700,8 @@ async def on_message(message: cl.Message):
                 tool_choice="auto",
                 stream=True,
                 temperature=0.7,
-                max_tokens=2000
+                max_tokens=2000,
+                extra_body={"reasoning_effort": "medium"}
             )
 
             async for chunk in stream:
