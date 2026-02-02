@@ -37,7 +37,7 @@ tools_schema = [
         "type": "function",
         "function": {
             "name": "update_file",
-            "description": "Update a file with new information. Intelligent merge is handled automatically.",
+            "description": "Update a file with new information. Intelligent merge is handled automatically. IMPORTANT: This tool CANNOT see files uploaded to the chat (images, PDFs). You must extract the text content yourself and pass it in the 'content' field.",
             "parameters": {
                 "type": "object",
                 "properties": {

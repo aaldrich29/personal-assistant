@@ -1,5 +1,5 @@
 [project]
-session_timeout = 3600
+session_timeout = 86400
 user_session_timeout = 1296000
 
 [UI]

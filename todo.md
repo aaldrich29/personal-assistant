@@ -3,8 +3,9 @@
 - [ ] Maybe give AI the ability to store the file and have it indexed.
 - [X] File handling or disallowing of other filestypes
 - [X] Simple markdown file editor
-- [ ] Allow editing of scheduler instructions, or adding customer instructions
+- [X] Allow editing of scheduler instructions, or adding customer instructions
 - [ ] MCP tool access?
-- [ ] Right now if I'm idle on chat and come back it will display message a second time - fix
-- [ ] Viewport is too tall on mobile
+- [X] Right now if I'm idle on chat and come back it will display message a second time - fix
+- [X] Viewport is too tall on mobile
+- [X] Either give update_file tool access to uploaded files or include instructions so that the AI knows the tool can't see files from the conversation
 - [ ] Save as PWA?

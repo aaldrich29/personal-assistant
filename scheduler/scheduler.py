@@ -174,13 +174,20 @@ def nightly_recap():
     # Load current learned behaviors
     learned_behaviors = read_vault_file("meta/learned_behaviors.md")
 
-    recap_prompt = f"""Analyze today's conversations and create a structured summary.
+    # Load prompt template
+    prompt_path = "meta/prompts/nightly_recap.md"
+    recap_prompt_template = read_vault_file(prompt_path)
+    
+    # Fallback if file doesn't exist
+    if not recap_prompt_template:
+        print(f"Warning: Prompt file {prompt_path} not found. Using default.")
+        recap_prompt_template = """Analyze today's conversations and create a structured summary.
 
 Current Family Information:
-{family_context if family_context else "No family members recorded yet."}
+{family_context}
 
 Current Learned Behaviors:
-{learned_behaviors if learned_behaviors else "No learned behaviors yet."}
+{learned_behaviors}
 
 Today's Conversations:
 {conversations}
@@ -214,6 +221,12 @@ NEW patterns, preferences, or follow-up items that should be added to the learne
 Only include items that are NEW and not already in the current learned behaviors.
 
 Keep it concise but comprehensive. Focus on actionable information."""
+
+    recap_prompt = recap_prompt_template.format(
+        family_context=family_context if family_context else "No family members recorded yet.",
+        learned_behaviors=learned_behaviors if learned_behaviors else "No learned behaviors yet.",
+        conversations=conversations
+    )
 
     try:
         response = client.chat.completions.create(
